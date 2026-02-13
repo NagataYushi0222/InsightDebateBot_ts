@@ -1,0 +1,12 @@
+node_modules
+dist
+.git
+.github
+*.md
+.env
+bot_settings.db
+temp_audio
+insight_bot
+__pycache__
+*.py
+*.pyc

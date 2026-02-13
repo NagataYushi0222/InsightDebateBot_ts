@@ -1,0 +1,37 @@
+# Node.js 20をベースイメージとして使用
+FROM node:20-slim
+
+# 作業ディレクトリを設定
+WORKDIR /app
+
+# システム依存関係をインストール
+# - ffmpeg: 音声処理に必要
+# - ca-certificates: SSL証明書
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    ca-certificates \
+    python3 \
+    make \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+# パッケージファイルをコピーしてインストール
+COPY package*.json ./
+COPY tsconfig.json ./
+RUN npm ci
+
+# アプリケーションコードをコピー
+COPY src/ ./src/
+
+# TypeScriptをビルド
+RUN npm run build
+
+# 一時音声ファイル用のディレクトリを作成
+RUN mkdir -p /app/temp_audio
+
+# 環境変数のデフォルト値（実行時にオーバーライド可能）
+ENV NODE_ENV=production
+ENV DISCORD_TOKEN=""
+
+# Botを起動
+CMD ["node", "dist/index.js"]
