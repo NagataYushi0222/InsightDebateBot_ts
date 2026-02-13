@@ -4,69 +4,69 @@ import { TEMP_AUDIO_DIR } from './config';
 import { ensureTempDir } from './audioProcessor';
 
 /**
- * ユーザーごとのPCMバッファを管理するレコーダー
- * discord.js の AudioReceiveStream からの Opus パケットを
- * prism-media で PCM にデコードし蓄積する
+ * ユーザーごとの音声をディスクに直接書き込むレコーダー
+ * メモリ使用量を抑えるため、バッファリングせずにストリームで書き込む
  */
 export class UserAudioRecorder {
-    private userBuffers: Map<string, Buffer[]> = new Map();
-    private timestamp: number;
+    private writeStreams: Map<string, fs.WriteStream> = new Map();
+    private activeFilePaths: Map<string, string> = new Map();
 
     constructor() {
-        this.timestamp = Math.floor(Date.now() / 1000);
         ensureTempDir();
     }
 
     /**
-     * ユーザーのPCMデータを追加
+     * ユーザーのPCMデータをファイルに書き込み
      */
     write(userId: string, pcmData: Buffer): void {
-        if (!this.userBuffers.has(userId)) {
-            this.userBuffers.set(userId, []);
+        let stream = this.writeStreams.get(userId);
+
+        if (!stream) {
+            const filename = path.join(
+                TEMP_AUDIO_DIR,
+                `recording_${userId}_${Date.now()}.pcm`
+            );
+            stream = fs.createWriteStream(filename, { flags: 'a' });
+            this.writeStreams.set(userId, stream);
+            this.activeFilePaths.set(userId, filename);
+
+            // エラーハンドリング
+            stream.on('error', (err) => {
+                console.error(`Stream error for user ${userId}:`, err);
+            });
         }
-        this.userBuffers.get(userId)!.push(pcmData);
+
+        stream.write(pcmData);
     }
 
     /**
-     * 蓄積された音声をディスクに保存し、バッファをクリア
-     * @returns ユーザーID → ファイルパスのマップ
+     * 現在書き込み中のファイルをクローズし、パスを返却する
+     * 次回の書き込み書き込み時に新しいファイルが作成される
      */
     flushAudio(): Map<string, string> {
-        const savedFiles = new Map<string, string>();
-        const now = Math.floor(Date.now() / 1000);
+        const flushedFiles = new Map<string, string>();
 
-        for (const [userId, chunks] of this.userBuffers.entries()) {
-            if (chunks.length === 0) continue;
+        for (const [userId, stream] of this.writeStreams.entries()) {
+            // ストリームを閉じる
+            stream.end();
 
-            const combined = Buffer.concat(chunks);
-            if (combined.length === 0) continue;
-
-            const filename = path.join(
-                TEMP_AUDIO_DIR,
-                `${this.timestamp}_${userId}_${now}.pcm`
-            );
-
-            try {
-                fs.writeFileSync(filename, combined);
-                savedFiles.set(userId, filename);
-            } catch (e) {
-                console.error(`Error saving audio for user ${userId}:`, e);
+            const filePath = this.activeFilePaths.get(userId);
+            if (filePath && fs.existsSync(filePath) && fs.statSync(filePath).size > 0) {
+                flushedFiles.set(userId, filePath);
             }
         }
 
-        // バッファクリア
-        this.userBuffers.clear();
+        // マップをクリア（次回の write で新規作成させる）
+        this.writeStreams.clear();
+        this.activeFilePaths.clear();
 
-        return savedFiles;
+        return flushedFiles;
     }
 
     /**
-     * 特定のユーザーにデータがあるか
+     * データが存在するか（書き込み中のストリームがあるか）
      */
     hasData(): boolean {
-        for (const chunks of this.userBuffers.values()) {
-            if (chunks.length > 0) return true;
-        }
-        return false;
+        return this.writeStreams.size > 0;
     }
 }

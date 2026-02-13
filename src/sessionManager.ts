@@ -182,13 +182,12 @@ export class GuildSession {
 
             // PCM → MP3 変換
             const userFilesMp3 = new Map<string, string>();
-            const filesToCleanup: string[] = [];
+            const filesToCleanup: string[] = Array.from(userFilesRaw.values());
 
             for (const [userId, rawPath] of userFilesRaw.entries()) {
                 const mp3Path = convertToMp3(rawPath);
                 if (mp3Path) {
                     userFilesMp3.set(userId, mp3Path);
-                    filesToCleanup.push(rawPath);
                     filesToCleanup.push(mp3Path);
                 }
             }

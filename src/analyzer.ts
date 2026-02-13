@@ -1,4 +1,4 @@
-import { GoogleGenAI, createUserContent, createPartFromUri } from '@google/genai';
+import { GoogleGenAI, createUserContent, createPartFromUri, DynamicRetrievalConfigMode } from '@google/genai';
 import fs from 'fs';
 import { GEMINI_API_KEY, GEMINI_MODEL_FLASH } from './config';
 
@@ -162,26 +162,66 @@ export async function analyzeDiscussion(
     try {
         await waitForFilesActive(ai, uploadedFiles);
 
-        // Gemini APIで分析実行
+        // Gemini APIで分析実行（まずはツールありで試行）
         const useModel = modelName || GEMINI_MODEL_FLASH;
-        const response = await ai.models.generateContent({
-            model: useModel,
-            contents: [
-                {
-                    role: 'user',
-                    parts,
-                },
-            ],
-            config: {
-                tools: [
+
+        try {
+            const response = await ai.models.generateContent({
+                model: useModel,
+                contents: [
                     {
-                        googleSearch: {},
+                        role: 'user',
+                        parts,
                     },
                 ],
-            },
-        });
+                config: {
+                    tools: [
+                        {
+                            googleSearchRetrieval: {
+                                dynamicRetrievalConfig: {
+                                    mode: DynamicRetrievalConfigMode.MODE_DYNAMIC,
+                                    dynamicThreshold: 0.6,
+                                },
+                            },
+                        },
+                    ],
+                },
+            });
 
-        // アップロードしたファイルをクリーンアップ
+            // クリーンアップ
+            for (const f of uploadedFiles) await ai.files.delete({ name: f.name }).catch(() => { });
+            return response.text || '分析結果が空でした。';
+
+        } catch (e: any) {
+            const errStr = String(e);
+
+            // 429エラーの場合、ツールなしでリトライ
+            if (errStr.includes('429') || errStr.includes('Quota exceeded') || errStr.includes('RESOURCE_EXHAUSTED')) {
+                console.warn('Rate limited. Retrying without Google Search...');
+                try {
+                    const responseRetry = await ai.models.generateContent({
+                        model: useModel,
+                        contents: [
+                            {
+                                role: 'user',
+                                parts,
+                            },
+                        ],
+                        // toolsなし
+                    });
+
+                    // クリーンアップ
+                    for (const f of uploadedFiles) await ai.files.delete({ name: f.name }).catch(() => { });
+                    return (responseRetry.text || '分析結果が空でした。') + '\n\n(※ リクエスト制限のため、Google検索なしで生成しました)';
+                } catch (retryErr) {
+                    throw retryErr; // リトライも失敗したら投げる
+                }
+            }
+            throw e;
+        }
+
+    } catch (e: any) {
+        // アップロードしたファイルをクリーンアップ（念のため）
         for (const f of uploadedFiles) {
             try {
                 await ai.files.delete({ name: f.name });
@@ -190,12 +230,10 @@ export async function analyzeDiscussion(
             }
         }
 
-        return response.text || '分析結果が空でした。';
-    } catch (e: any) {
         console.error(`Analysis Error: ${e}`);
         const errStr = String(e);
         if (errStr.includes('429') || errStr.includes('Quota exceeded')) {
-            return '⚠️ 分析のリクエスト制限（Quota Limit）に達しました。';
+            return '⚠️ 分析のリクエスト制限（Quota Limit）に達しました。Google検索の使用が制限されている可能性があります。時間を置いて試してください。';
         }
         return `分析中にエラーが発生しました: ${e}`;
     }
