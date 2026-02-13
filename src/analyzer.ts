@@ -1,4 +1,4 @@
-import { GoogleGenAI, createUserContent, createPartFromUri, DynamicRetrievalConfigMode } from '@google/genai';
+import { GoogleGenAI, createUserContent, createPartFromUri } from '@google/genai';
 import fs from 'fs';
 import { GEMINI_API_KEY, GEMINI_MODEL_FLASH } from './config';
 
@@ -176,14 +176,7 @@ export async function analyzeDiscussion(
                 ],
                 config: {
                     tools: [
-                        {
-                            googleSearchRetrieval: {
-                                dynamicRetrievalConfig: {
-                                    mode: DynamicRetrievalConfigMode.MODE_DYNAMIC,
-                                    dynamicThreshold: 0.6,
-                                },
-                            },
-                        },
+                        { googleSearch: {} },
                     ],
                 },
             });
