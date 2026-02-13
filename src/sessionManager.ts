@@ -207,19 +207,7 @@ export class GuildSession {
             try {
                 if (!this.targetTextChannel) return;
 
-                const autoStr = isManual ? '手動分析' : '自動分析';
-                const starterMsg = await this.targetTextChannel.send(
-                    `📅 **${autoStr}** (${timestampStr})`
-                );
-                const reportThread = await starterMsg.startThread({
-                    name: threadName,
-                    autoArchiveDuration: 60,
-                });
-                await reportThread.send(
-                    `🔄 音声ファイルを分析中... (Mode: ${this.settings.analysis_mode}, Model: ${this.settings.model_name})`
-                );
-
-                // 分析実行
+                // 分析実行（スレッド作成前に行う）
                 const report = await analyzeDiscussion(
                     userFilesMp3,
                     this.lastContext,
@@ -231,6 +219,15 @@ export class GuildSession {
 
                 // コンテキストを更新
                 this.lastContext = report.slice(-2000);
+
+                const autoStr = isManual ? '手動分析' : '自動分析';
+                const starterMsg = await this.targetTextChannel.send(
+                    `📅 **${autoStr}** (${timestampStr})`
+                );
+                const reportThread = await starterMsg.startThread({
+                    name: threadName,
+                    autoArchiveDuration: 60,
+                });
 
                 // レポートを投稿
                 const header = isManual
