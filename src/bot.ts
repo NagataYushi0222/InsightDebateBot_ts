@@ -35,18 +35,17 @@ const sessionManager = new SessionManager(client);
 // === コマンド定義 ===
 const commands = [
     new SlashCommandBuilder()
-        .setName('analyze_start')
-        .setDescription('ボイスチャットの分析を開始します'),
-
-    new SlashCommandBuilder()
-        .setName('analyze_now')
-        .setDescription(
-            '現在までの会話を強制的に分析・要約します（定期分析のリセットは行いません）'
+        .setName('rec')
+        .setDescription('録音・分析を制御します')
+        .addSubcommand((sub) =>
+            sub.setName('start').setDescription('録音と分析を開始します')
+        )
+        .addSubcommand((sub) =>
+            sub.setName('stop').setDescription('録音を停止し、分析して終了します')
+        )
+        .addSubcommand((sub) =>
+            sub.setName('now').setDescription('現在までの会話を強制的に分析します')
         ),
-
-    new SlashCommandBuilder()
-        .setName('analyze_stop')
-        .setDescription('分析を終了し、ボイスチャットから退出します'),
 
     new SlashCommandBuilder()
         .setName('settings')
@@ -137,22 +136,21 @@ client.on('interactionCreate', async (interaction) => {
     const guildId = interaction.guild.id;
 
     try {
-        switch (interaction.commandName) {
-            case 'analyze_start':
-                await handleAnalyzeStart(interaction, guildId);
-                break;
-
-            case 'analyze_now':
-                await handleAnalyzeNow(interaction, guildId);
-                break;
-
-            case 'analyze_stop':
-                await handleAnalyzeStop(interaction, guildId);
-                break;
-
-            case 'settings':
-                await handleSettings(interaction, guildId);
-                break;
+        if (interaction.commandName === 'rec') {
+            const subcommand = interaction.options.getSubcommand();
+            switch (subcommand) {
+                case 'start':
+                    await handleAnalyzeStart(interaction, guildId);
+                    break;
+                case 'stop':
+                    await handleAnalyzeStop(interaction, guildId);
+                    break;
+                case 'now':
+                    await handleAnalyzeNow(interaction, guildId);
+                    break;
+            }
+        } else if (interaction.commandName === 'settings') {
+            await handleSettings(interaction, guildId);
         }
     } catch (e: any) {
         // Unknown interaction (10062) は無視する
@@ -254,11 +252,14 @@ async function handleAnalyzeNow(
     const session = sessionManager.getSession(guildId);
 
     if (session.voiceConnection) {
-        await interaction.reply('分析リクエストを受け付けました。');
+        await interaction.reply({
+            content: '分析リクエストを受け付けました。しばらくお待ちください...',
+            flags: MessageFlags.Ephemeral
+        });
         await session.processAudio(true);
     } else {
         await interaction.reply({
-            content: '分析は実行されていません。先に /analyze_start を実行してください。',
+            content: '分析は実行されていません。先に /rec start を実行してください。',
             flags: MessageFlags.Ephemeral,
         });
     }
