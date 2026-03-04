@@ -2,13 +2,10 @@
   "name": "insightdebatebot",
   "version": "1.0.0",
   "description": "Discord上のボイスチャットを自動録音・分析し、議論の要約や対立構造を可視化するAI Botです。",
-  "main": "dist/index.js",
+  "main": "src/index.ts",
   "scripts": {
-    "build": "tsc",
-    "start": "node dist/index.js",
-    "dev": "tsx src/index.ts",
-    "kill-win": "taskkill /F /IM node.exe || exit 0",
-    "start-fresh": "npm run kill-win && npm run dev",
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch run src/index.ts",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {
@@ -18,7 +15,6 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "commonjs",
   "bugs": {
     "url": "https://github.com/NagataYushi0222/InsightDebateBot/issues"
   },
@@ -29,7 +25,6 @@
     "@ovencord/util": "^1.10.0",
     "@ovencord/voice": "^0.19.8",
     "@snazzah/davey": "^0.1.10",
-    "better-sqlite3": "^12.6.2",
     "discord.js": "^14.25.1",
     "dotenv": "^17.2.4",
     "ffmpeg-static": "^5.3.0",
@@ -39,11 +34,6 @@
     "tweetnacl": "^1.0.3"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.13",
-    "@types/node": "^25.3.3",
-    "cross-env": "^10.1.0",
-    "npm-run-all": "^4.1.5",
-    "tsx": "^4.21.0",
-    "typescript": "^5.9.3"
+    "@types/bun": "latest"
   }
 }

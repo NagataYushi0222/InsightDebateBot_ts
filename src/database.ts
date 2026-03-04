@@ -1,14 +1,14 @@
-import Database from 'better-sqlite3';
+import { Database } from 'bun:sqlite';
 import path from 'path';
 
 const DB_PATH = path.resolve('bot_settings.db');
 
-let db: Database.Database;
+let db: Database;
 
-function getConnection(): Database.Database {
+function getConnection(): Database {
     if (!db) {
         db = new Database(DB_PATH);
-        db.pragma('journal_mode = WAL');
+        db.run('PRAGMA journal_mode = WAL');
     }
     return db;
 }
@@ -25,7 +25,7 @@ export interface GuildSettings {
 
 export function initDb(): void {
     const conn = getConnection();
-    conn.exec(`
+    conn.run(`
     CREATE TABLE IF NOT EXISTS guild_settings (
       guild_id TEXT PRIMARY KEY,
       api_key TEXT,

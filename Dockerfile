@@ -1,5 +1,5 @@
-# Node.js 20をベースイメージとして使用
-FROM node:20-slim
+# Bun をベースイメージとして使用
+FROM oven/bun:1-slim
 
 # 作業ディレクトリを設定
 WORKDIR /app
@@ -10,21 +10,15 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     ca-certificates \
-    python3 \
-    make \
-    g++ \
     && rm -rf /var/lib/apt/lists/*
 
 # パッケージファイルをコピーしてインストール
-COPY package*.json ./
-COPY tsconfig.json ./
-RUN npm ci
+COPY package.json bun.lock* ./
+RUN bun install --production
 
 # アプリケーションコードをコピー
 COPY src/ ./src/
-
-# TypeScriptをビルド
-RUN npm run build
+COPY tsconfig.json ./
 
 # 一時音声ファイル用のディレクトリを作成
 RUN mkdir -p /app/temp_audio
@@ -33,5 +27,5 @@ RUN mkdir -p /app/temp_audio
 ENV NODE_ENV=production
 ENV DISCORD_TOKEN=""
 
-# Botを起動
-CMD ["node", "dist/index.js"]
+# Bun でTypeScriptを直接実行
+CMD ["bun", "run", "src/index.ts"]
