@@ -13,6 +13,7 @@ export const CHANNELS = 2;
 // Models
 export const GEMINI_MODEL_FLASH = 'gemini-2.5-flash';
 export const GEMINI_MODEL_3_FLASH = 'gemini-3-flash-preview';
+export const GEMINI_MODEL_31_FLASH_LITE = 'gemini-3.1-flash-lite-preview';
 export const DEFAULT_MODEL = GEMINI_MODEL_3_FLASH;
 
 // Paths

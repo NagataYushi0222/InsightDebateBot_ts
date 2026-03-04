@@ -13,8 +13,8 @@ import {
     joinVoiceChannel,
     VoiceConnectionStatus,
     entersState,
-} from '@discordjs/voice';
-import { DISCORD_TOKEN, GUILD_ID, GEMINI_MODEL_FLASH, GEMINI_MODEL_3_FLASH } from './config';
+} from '@ovencord/voice';
+import { DISCORD_TOKEN, GUILD_ID, GEMINI_MODEL_FLASH, GEMINI_MODEL_3_FLASH, GEMINI_MODEL_31_FLASH_LITE } from './config';
 import { initDb, updateGuildSetting } from './database';
 import { SessionManager } from './sessionManager';
 
@@ -96,8 +96,24 @@ const commands = [
                         .setRequired(true)
                         .addChoices(
                             { name: 'Gemini 2.5 Flash', value: GEMINI_MODEL_FLASH },
-                            { name: 'Gemini 3 Flash (Preview)', value: GEMINI_MODEL_3_FLASH }
+                            { name: 'Gemini 3 Flash (Preview)', value: GEMINI_MODEL_3_FLASH },
+                            { name: 'Gemini 3.1 Flash Lite (Preview)', value: GEMINI_MODEL_31_FLASH_LITE }
                         )
+                )
+        ),
+
+    new SlashCommandBuilder()
+        .setName('model')
+        .setDescription('使用するAIモデルを変更します')
+        .addStringOption((opt) =>
+            opt
+                .setName('model')
+                .setDescription('モデル')
+                .setRequired(true)
+                .addChoices(
+                    { name: 'Gemini 2.5 Flash', value: GEMINI_MODEL_FLASH },
+                    { name: 'Gemini 3 Flash (Preview)', value: GEMINI_MODEL_3_FLASH },
+                    { name: 'Gemini 3.1 Flash Lite (Preview)', value: GEMINI_MODEL_31_FLASH_LITE }
                 )
         ),
 ];
@@ -151,6 +167,8 @@ client.on('interactionCreate', async (interaction) => {
             }
         } else if (interaction.commandName === 'settings') {
             await handleSettings(interaction, guildId);
+        } else if (interaction.commandName === 'model') {
+            await handleModel(interaction, guildId);
         }
     } catch (e: any) {
         // Unknown interaction (10062) は無視する
@@ -205,9 +223,34 @@ async function handleAnalyzeStart(
             guildId: guildId,
             adapterCreator: interaction.guild!.voiceAdapterCreator,
             selfDeaf: false,
+            debug: true,
         });
 
-        // 接続完了を待つ
+        // デバッグログを追加（接続失敗の原因特定用）
+        connection.on('stateChange', (oldState, newState) => {
+            console.log(`[Voice] ${oldState.status} -> ${newState.status}`);
+
+            // Disconnected 状態になった場合、再接続を試みる
+            if (newState.status === VoiceConnectionStatus.Disconnected) {
+                try {
+                    console.log('[Voice] Disconnected. Attempting to reconnect...');
+                    entersState(connection, VoiceConnectionStatus.Connecting, 5_000)
+                        .catch(() => {
+                            console.log('[Voice] Reconnect failed. Destroying connection.');
+                            connection.destroy();
+                        });
+                } catch {
+                    connection.destroy();
+                }
+            }
+        });
+        connection.on('error', error => {
+            console.error('[Voice] Connection Error:', error);
+        });
+        connection.on('debug', (message) => {
+            console.log(`[Voice Debug] ${message}`);
+        });
+
         await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
 
         await interaction.followUp(
@@ -310,6 +353,17 @@ async function handleSettings(
             break;
         }
     }
+}
+
+async function handleModel(
+    interaction: ChatInputCommandInteraction,
+    guildId: string
+): Promise<void> {
+    const model = interaction.options.getString('model', true);
+    updateGuildSetting(guildId, 'model_name', model);
+    await interaction.reply(
+        `✅ 使用モデルを **${model}** に変更しました。`
+    );
 }
 
 // === Bot起動 ===

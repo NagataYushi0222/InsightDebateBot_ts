@@ -2,7 +2,7 @@ import {
     VoiceConnection,
     AudioReceiveStream,
     EndBehaviorType,
-} from '@discordjs/voice';
+} from '@ovencord/voice';
 import { Client, TextChannel, Guild } from 'discord.js';
 import { UserAudioRecorder } from './recorder';
 import { convertToMp3, cleanupFiles } from './audioProcessor';
@@ -64,27 +64,33 @@ export class GuildSession {
             }
             const decoder = this.opusDecoders.get(userId)!;
 
-            opusStream.on('data', (packet: Buffer) => {
-                if (!this.isRecording || !this.recorder) return;
-
+            // Web Streams APIのリーダーでOpusパケットを読み取る
+            const reader = opusStream.stream.getReader();
+            const readLoop = async () => {
                 try {
-                    const pcmData = decoder.decode(packet);
-                    if (pcmData) {
-                        this.recorder.write(userId, pcmData);
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done || !value) break;
+
+                        if (!this.isRecording || !this.recorder) continue;
+
+                        try {
+                            const pcmData = decoder.decode(Buffer.from(value));
+                            if (pcmData) {
+                                this.recorder.write(userId, pcmData);
+                            }
+                        } catch (e) {
+                            // デコードエラーは無視（パケットロス等）
+                        }
                     }
-                } catch (e) {
-                    // デコードエラーは無視（パケットロス等）
+                } catch (err: any) {
+                    console.error(`Audio stream error for user ${userId}:`, err.message);
+                } finally {
+                    this.subscribedUsers.delete(userId);
+                    this.opusDecoders.delete(userId);
                 }
-            });
-
-            opusStream.on('error', (err: Error) => {
-                console.error(`Audio stream error for user ${userId}:`, err.message);
-            });
-
-            opusStream.on('end', () => {
-                this.subscribedUsers.delete(userId);
-                this.opusDecoders.delete(userId);
-            });
+            };
+            readLoop();
         });
 
         // 定期分析ループを開始
