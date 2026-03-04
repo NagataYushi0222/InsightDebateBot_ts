@@ -51,6 +51,48 @@ npm start
 npm run start-fresh
 ```
 
+## Docker / macOS での実行方法
+
+Mac環境（Intel / Apple Silicon M1・M2等）で実行する場合は、環境構築が不要なDockerを使用するのが最も簡単です。
+
+### 1. Dockerのインストール
+[Docker Desktop for Mac](https://www.docker.com/products/docker-desktop/) をインストールし、起動しておきます。
+
+### 2. 準備
+ターミナルを開き、リポジトリをクローンまたは移動します。
+
+```bash
+git clone https://github.com/NagataYushi0222/InsightDebateBot.git
+cd InsightDebateBot
+```
+
+### 3. 設定ファイルの作成
+`.env` ファイルを作成し、トークンなどを設定します。
+
+```bash
+cp env.template .env
+nano .env  # またはお好みのエディタで開いて編集してください
+```
+
+### 4. データベースファイルの作成
+※重要: 初回起動前にデータベースの空ファイルを作成しないと、Dockerが誤ってディレクトリとして作成してしまいエラーになります。
+
+```bash
+touch bot_settings.db
+```
+
+### 5. Dockerコンテナの起動
+以下のコマンドでビルドと起動を行います（バックグラウンド実行されます）。
+
+```bash
+docker compose up -d --build
+```
+
+### Dockerの便利なコマンド
+- **ログの確認**: `docker compose logs -f` (Botの動作状況やエラーを確認できます)
+- **コンテナの停止**: `docker compose down`
+- **再起動**: `docker compose restart`
+
 ## コマンド一覧
 
 ### 録音・分析コマンド
@@ -69,6 +111,7 @@ npm run start-fresh
   - `gemini-3-flash-preview`: 高性能
 
 ## トラブルシューティング
+- **MACで音声が録音されない/エラーになる**: Dockerコンテナ内で必要なFFmpeg等は自動でインストールされます。もし `docker-compose up` 時にエラーになる場合は、Docker Desktopのリソース割り当てを少し増やしてみてください。
 - **429 Quota Exceeded**: Google Gemini APIの制限です。自動的に検索機能をオフにしてリトライしますが、頻発する場合は `/settings set_model` でモデルを変更してください。
 
 ## ライセンス
