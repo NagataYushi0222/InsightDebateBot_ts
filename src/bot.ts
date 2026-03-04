@@ -14,8 +14,8 @@ import {
     VoiceConnectionStatus,
     entersState,
 } from '@ovencord/voice';
-import { DISCORD_TOKEN, GUILD_ID, GEMINI_MODEL_FLASH, GEMINI_MODEL_3_FLASH, GEMINI_MODEL_31_FLASH_LITE } from './config';
-import { initDb, updateGuildSetting } from './database';
+import { DISCORD_TOKEN, GUILD_ID, GEMINI_MODEL_FLASH, GEMINI_MODEL_3_FLASH, GEMINI_MODEL_31_FLASH_LITE, DEFAULT_MODEL } from './config';
+import { initDb, updateGuildSetting, getGuildSettings } from './database';
 import { SessionManager } from './sessionManager';
 
 // データベース初期化
@@ -116,6 +116,10 @@ const commands = [
                     { name: 'Gemini 3.1 Flash Lite (Preview)', value: GEMINI_MODEL_31_FLASH_LITE }
                 )
         ),
+
+    new SlashCommandBuilder()
+        .setName('check')
+        .setDescription('現在のBot設定を確認します'),
 ];
 
 // === イベントハンドラ ===
@@ -169,6 +173,8 @@ client.on('interactionCreate', async (interaction) => {
             await handleSettings(interaction, guildId);
         } else if (interaction.commandName === 'model') {
             await handleModel(interaction, guildId);
+        } else if (interaction.commandName === 'check') {
+            await handleCheck(interaction, guildId);
         }
     } catch (e: any) {
         // Unknown interaction (10062) は無視する
@@ -364,6 +370,65 @@ async function handleModel(
     await interaction.reply(
         `✅ 使用モデルを **${model}** に変更しました。`
     );
+}
+
+function getModelDisplayName(modelId: string): string {
+    switch (modelId) {
+        case GEMINI_MODEL_FLASH: return 'Gemini 2.5 Flash';
+        case GEMINI_MODEL_3_FLASH: return 'Gemini 3 Flash (Preview)';
+        case GEMINI_MODEL_31_FLASH_LITE: return 'Gemini 3.1 Flash Lite (Preview)';
+        default: return modelId;
+    }
+}
+
+function getModeDisplayName(mode: string): string {
+    switch (mode) {
+        case 'debate': return '🗣️ ディベート (debate)';
+        case 'summary': return '📝 要約 (summary)';
+        default: return mode;
+    }
+}
+
+async function handleCheck(
+    interaction: ChatInputCommandInteraction,
+    guildId: string
+): Promise<void> {
+    const settings = getGuildSettings(guildId);
+    const session = sessionManager.getSession(guildId);
+    const isRecording = !!session.voiceConnection;
+
+    const modelName = settings.model_name || DEFAULT_MODEL;
+    const modelDisplay = getModelDisplayName(modelName);
+    const modeDisplay = getModeDisplayName(settings.analysis_mode || 'debate');
+    const interval = settings.recording_interval || 300;
+    const hasApiKey = !!settings.api_key;
+
+    const statusEmoji = isRecording ? '🔴 録音中' : '⏹️ 停止中';
+
+    const embed = [
+        '━━━━━━━━━━━━━━━━━━━━━━',
+        '⚙️ **現在のBot設定**',
+        '━━━━━━━━━━━━━━━━━━━━━━',
+        '',
+        `🤖 **使用モデル**: ${modelDisplay}`,
+        `   \`${modelName}\``,
+        '',
+        `📋 **分析モード**: ${modeDisplay}`,
+        '',
+        `⏱️ **分析間隔**: ${interval}秒 (${(interval / 60).toFixed(1)}分)`,
+        '',
+        `🧠 **推論レベル**: 🔥 最高 (high)`,
+        '',
+        `🔑 **APIキー**: ${hasApiKey ? '✅ 設定済み (BYOK)' : '🌐 環境変数を使用'}`,
+        '',
+        `📡 **ステータス**: ${statusEmoji}`,
+        '━━━━━━━━━━━━━━━━━━━━━━',
+    ].join('\n');
+
+    await interaction.reply({
+        content: embed,
+        flags: MessageFlags.Ephemeral,
+    });
 }
 
 // === Bot起動 ===

@@ -164,6 +164,7 @@ export async function analyzeDiscussion(
 
         // Gemini APIで分析実行（まずはツールありで試行）
         const useModel = modelName || GEMINI_MODEL_FLASH;
+        console.log(`[Analyzer] 使用モデル: ${useModel}`);
 
         try {
             const response = await ai.models.generateContent({
@@ -178,6 +179,9 @@ export async function analyzeDiscussion(
                     tools: [
                         { googleSearch: {} },
                     ],
+                    thinkingConfig: {
+                        thinkingLevel: 'HIGH' as any,
+                    },
                 },
             });
 
@@ -200,7 +204,11 @@ export async function analyzeDiscussion(
                                 parts,
                             },
                         ],
-                        // toolsなし
+                        config: {
+                            thinkingConfig: {
+                                thinkingLevel: 'HIGH' as any,
+                            },
+                        },
                     });
 
                     // クリーンアップ
