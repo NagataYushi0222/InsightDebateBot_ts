@@ -2,6 +2,7 @@ import {
     VoiceConnection,
     AudioReceiveStream,
     EndBehaviorType,
+    VoiceConnectionStatus,
 } from '@ovencord/voice';
 import { Client, TextChannel, Guild } from 'discord.js';
 import { UserAudioRecorder } from './recorder';
@@ -104,6 +105,24 @@ export class GuildSession {
         this.processLoop();
     }
 
+    hasActiveConnection(): boolean {
+        return !!this.voiceConnection && this.voiceConnection.state.status !== VoiceConnectionStatus.Destroyed;
+    }
+
+    handleDestroyedConnection(connection: VoiceConnection): boolean {
+        if (this.voiceConnection !== connection) return false;
+
+        this.isProcessLoopRunning = false;
+        this.isRecording = false;
+        this.voiceConnection = null;
+        this.recorder = null;
+        this.opusDecoders.clear();
+        this.subscribedUsers.clear();
+        this.countdownMessage = null;
+
+        return true;
+    }
+
     /**
      * 録音を停止する
      */
@@ -124,7 +143,9 @@ export class GuildSession {
         this.subscribedUsers.clear();
 
         if (this.voiceConnection) {
-            this.voiceConnection.destroy();
+            if (this.voiceConnection.state.status !== VoiceConnectionStatus.Destroyed) {
+                this.voiceConnection.destroy();
+            }
             this.voiceConnection = null;
         }
 
@@ -389,6 +410,15 @@ export class SessionManager {
     async cleanupSession(guildId: string, skipFinal: boolean = false): Promise<void> {
         if (this.sessions.has(guildId)) {
             await this.sessions.get(guildId)!.stopRecording(skipFinal);
+            this.sessions.delete(guildId);
+        }
+    }
+
+    cleanupDestroyedConnection(guildId: string, connection: VoiceConnection): void {
+        const session = this.sessions.get(guildId);
+        if (!session) return;
+
+        if (session.handleDestroyedConnection(connection)) {
             this.sessions.delete(guildId);
         }
     }

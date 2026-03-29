@@ -202,9 +202,9 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
         const guildId = oldState.guild.id;
         const session = sessionManager.getSession(guildId);
 
-        if (!session.voiceConnection || !session.isRecording) return;
+        if (!session.hasActiveConnection() || !session.isRecording) return;
 
-        const botChannelId = session.voiceConnection.joinConfig.channelId;
+        const botChannelId = session.voiceConnection!.joinConfig.channelId;
         
         // Botがいるチャンネルから退出した場合
         if (oldState.channelId === botChannelId) {
@@ -256,7 +256,7 @@ async function handleAnalyzeStart(
     const session = sessionManager.getSession(guildId);
 
     // 既に録音中か確認
-    if (session.voiceConnection) {
+    if (session.hasActiveConnection()) {
         await interaction.followUp('既に分析を実行中です。');
         return;
     }
@@ -288,6 +288,11 @@ async function handleAnalyzeStart(
                     connection.destroy();
                 }
             }
+
+            if (newState.status === VoiceConnectionStatus.Destroyed) {
+                console.log('[Voice] Connection destroyed. Cleaning up stale session state.');
+                sessionManager.cleanupDestroyedConnection(guildId, connection);
+            }
         });
         connection.on('error', error => {
             console.error('[Voice] Connection Error:', error);
@@ -315,7 +320,7 @@ async function handleAnalyzeStart(
             initialMessage
         );
     } catch (e) {
-        if (session.voiceConnection) {
+        if (session.hasActiveConnection()) {
             await session.stopRecording(true);
         }
         await interaction.followUp(`エラーが発生しました: ${e}`);
@@ -329,7 +334,7 @@ async function handleAnalyzeStop(
     await interaction.deferReply();
     const session = sessionManager.getSession(guildId);
 
-    if (session.voiceConnection) {
+    if (session.hasActiveConnection()) {
         await sessionManager.cleanupSession(guildId, true);
         await interaction.followUp('✅ 分析を終了しました。お疲れ様でした！');
     } else {
@@ -347,7 +352,7 @@ async function handleAnalyzeStopFinal(
     await interaction.deferReply();
     const session = sessionManager.getSession(guildId);
 
-    if (session.voiceConnection) {
+    if (session.hasActiveConnection()) {
         await interaction.followUp('🔄 最終レポートを作成して終了します。しばらくお待ちください...');
         await sessionManager.cleanupSession(guildId, false);
         await interaction.followUp('✅ 最終レポートを作成し、分析を終了しました。お疲れ様でした！');
@@ -366,7 +371,7 @@ async function handleAnalyzeNow(
 ): Promise<void> {
     const session = sessionManager.getSession(guildId);
 
-    if (session.voiceConnection) {
+    if (session.hasActiveConnection()) {
         await interaction.reply({
             content: '🔄 手動分析を開始しました...'
         });
@@ -502,7 +507,7 @@ async function handleCheck(
 ): Promise<void> {
     const settings = getGuildSettings(guildId);
     const session = sessionManager.getSession(guildId);
-    const isRecording = !!session.voiceConnection;
+    const isRecording = session.hasActiveConnection();
 
     const modelName = settings.model_name || DEFAULT_MODEL;
     const modelDisplay = getModelDisplayName(modelName);
