@@ -15,7 +15,7 @@ import {
     entersState,
 } from '@ovencord/voice';
 import { DISCORD_TOKEN, GUILD_ID, GEMINI_MODEL_FLASH, GEMINI_MODEL_3_FLASH, GEMINI_MODEL_31_FLASH_LITE, DEFAULT_MODEL } from './config';
-import { initDb, updateGuildSetting, getGuildSettings } from './database';
+import { initDb, updateGuildSetting, getGuildSettings, getUserKey, setUserKey } from './database';
 import { SessionManager } from './sessionManager';
 
 // データベース初期化
@@ -35,25 +35,28 @@ const sessionManager = new SessionManager(client);
 // === コマンド定義 ===
 const commands = [
     new SlashCommandBuilder()
-        .setName('rec')
-        .setDescription('録音・分析を制御します')
-        .addSubcommand((sub) =>
-            sub.setName('start').setDescription('録音と分析を開始します')
-        )
-        .addSubcommand((sub) =>
-            sub.setName('stop').setDescription('録音を停止し、分析して終了します')
-        )
-        .addSubcommand((sub) =>
-            sub.setName('now').setDescription('現在までの会話を強制的に分析します')
-        ),
+        .setName('analyze_start')
+        .setDescription('ボイスチャットの分析を開始します'),
+        
+    new SlashCommandBuilder()
+        .setName('analyze_stop')
+        .setDescription('分析を終了します（最終レポートなし）'),
+        
+    new SlashCommandBuilder()
+        .setName('analyze_now')
+        .setDescription('すぐにレポートを作成します（分析間隔を待たずに実行）'),
+        
+    new SlashCommandBuilder()
+        .setName('analyze_stop_final')
+        .setDescription('最終レポートを作成してから分析を終了します'),
 
     new SlashCommandBuilder()
         .setName('settings')
         .setDescription('Botの設定を変更します')
         .addSubcommand((sub) =>
             sub
-                .setName('set_key')
-                .setDescription('Gemini APIキーを設定します（BYOK）')
+                .setName('set_apikey')
+                .setDescription('Gemini APIキーを設定・更新します（あなた専用のキーとして保存されます）')
                 .addStringOption((opt) =>
                     opt.setName('key').setDescription('APIキー').setRequired(true)
                 )
@@ -156,19 +159,14 @@ client.on('interactionCreate', async (interaction) => {
     const guildId = interaction.guild.id;
 
     try {
-        if (interaction.commandName === 'rec') {
-            const subcommand = interaction.options.getSubcommand();
-            switch (subcommand) {
-                case 'start':
-                    await handleAnalyzeStart(interaction, guildId);
-                    break;
-                case 'stop':
-                    await handleAnalyzeStop(interaction, guildId);
-                    break;
-                case 'now':
-                    await handleAnalyzeNow(interaction, guildId);
-                    break;
-            }
+        if (interaction.commandName === 'analyze_start') {
+            await handleAnalyzeStart(interaction, guildId);
+        } else if (interaction.commandName === 'analyze_stop') {
+            await handleAnalyzeStop(interaction, guildId);
+        } else if (interaction.commandName === 'analyze_now') {
+            await handleAnalyzeNow(interaction, guildId);
+        } else if (interaction.commandName === 'analyze_stop_final') {
+            await handleAnalyzeStopFinal(interaction, guildId);
         } else if (interaction.commandName === 'settings') {
             await handleSettings(interaction, guildId);
         } else if (interaction.commandName === 'model') {
@@ -195,12 +193,53 @@ client.on('interactionCreate', async (interaction) => {
     }
 });
 
+client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
+    // 自身のイベントは無視
+    if (oldState.member?.id === client.user?.id) return;
+
+    // ユーザーがチャンネルから退出したか確認
+    if (oldState.channelId && oldState.channelId !== newState.channelId) {
+        const guildId = oldState.guild.id;
+        const session = sessionManager.getSession(guildId);
+
+        if (!session.voiceConnection || !session.isRecording) return;
+
+        const botChannelId = session.voiceConnection.joinConfig.channelId;
+        
+        // Botがいるチャンネルから退出した場合
+        if (oldState.channelId === botChannelId) {
+            const channel = oldState.channel;
+            if (channel) {
+                // Bot以外のメンバーの数をカウント
+                const nonBotMembers = channel.members.filter(m => !m.user.bot);
+                if (nonBotMembers.size === 0) {
+                    // 全員退出したので終了処理
+                    const textChannel = session.targetTextChannel;
+                    if (textChannel) {
+                        await textChannel.send("👋 全員がボイスチャンネルから退出したため、自動的に分析を終了します。");
+                    }
+                    await sessionManager.cleanupSession(guildId, false);
+                }
+            }
+        }
+    }
+});
+
 // === コマンドハンドラ ===
 
 async function handleAnalyzeStart(
     interaction: ChatInputCommandInteraction,
     guildId: string
 ): Promise<void> {
+    const userKey = getUserKey(interaction.user.id);
+    if (!userKey) {
+        await interaction.reply({
+            content: '❌ **APIキーが設定されていません**。\\n`/settings set_apikey [あなたのキー]` で一度だけ登録してください。',
+            flags: MessageFlags.Ephemeral,
+        });
+        return;
+    }
+
     const member = interaction.guild!.members.cache.get(interaction.user.id);
     const voiceChannel = member?.voice.channel;
 
@@ -259,18 +298,25 @@ async function handleAnalyzeStart(
 
         await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
 
-        await interaction.followUp(
-            `${voiceChannel.name} の分析を開始しました。プライバシー保護のため、録音・分析が行われることを参加者に周知してください。`
-        );
+        const settings = getGuildSettings(guildId);
+        const mode = settings.analysis_mode || 'debate';
+        const interval = settings.recording_interval || 300;
+        const intervalMins = Math.floor(interval / 60);
+
+        const initialMsgContent = `👥｜**${voiceChannel.name}** の分析を開始しました。\\nプライバシー保護のため、録音・分析が行われることを参加者に周知してください。\\n\`[設定] 間隔: ${intervalMins}分 / モード: ${mode}\`\\n\\n⏳ 次のレポート出力まで: 約 ${intervalMins}分`;
+
+        const initialMessage = await interaction.followUp(initialMsgContent);
 
         // セッションで録音開始
         await session.startRecording(
             connection,
-            interaction.channel as TextChannel
+            interaction.channel as TextChannel,
+            userKey,
+            initialMessage
         );
     } catch (e) {
         if (session.voiceConnection) {
-            await session.stopRecording();
+            await session.stopRecording(true);
         }
         await interaction.followUp(`エラーが発生しました: ${e}`);
     }
@@ -280,13 +326,33 @@ async function handleAnalyzeStop(
     interaction: ChatInputCommandInteraction,
     guildId: string
 ): Promise<void> {
+    await interaction.deferReply();
     const session = sessionManager.getSession(guildId);
 
     if (session.voiceConnection) {
-        await sessionManager.cleanupSession(guildId);
-        await interaction.reply('分析を終了しました。');
+        await sessionManager.cleanupSession(guildId, true);
+        await interaction.followUp('✅ 分析を終了しました。お疲れ様でした！');
     } else {
-        await interaction.reply({
+        await interaction.followUp({
+            content: '分析は実行されていません。',
+            flags: MessageFlags.Ephemeral,
+        });
+    }
+}
+
+async function handleAnalyzeStopFinal(
+    interaction: ChatInputCommandInteraction,
+    guildId: string
+): Promise<void> {
+    await interaction.deferReply();
+    const session = sessionManager.getSession(guildId);
+
+    if (session.voiceConnection) {
+        await interaction.followUp('🔄 最終レポートを作成して終了します。しばらくお待ちください...');
+        await sessionManager.cleanupSession(guildId, false);
+        await interaction.followUp('✅ 最終レポートを作成し、分析を終了しました。お疲れ様でした！');
+    } else {
+        await interaction.followUp({
             content: '分析は実行されていません。',
             flags: MessageFlags.Ephemeral,
         });
@@ -302,13 +368,12 @@ async function handleAnalyzeNow(
 
     if (session.voiceConnection) {
         await interaction.reply({
-            content: '分析リクエストを受け付けました。しばらくお待ちください...',
-            flags: MessageFlags.Ephemeral
+            content: '🔄 手動分析を開始しました...'
         });
-        await session.processAudio(true);
+        await session.processAudio(true, false);
     } else {
         await interaction.reply({
-            content: '分析は実行されていません。先に /rec start を実行してください。',
+            content: '分析は実行されていません。先に /analyze_start を実行してください。',
             flags: MessageFlags.Ephemeral,
         });
     }
@@ -321,19 +386,49 @@ async function handleSettings(
     const subcommand = interaction.options.getSubcommand();
 
     switch (subcommand) {
-        case 'set_key': {
-            const key = interaction.options.getString('key', true);
-            updateGuildSetting(guildId, 'api_key', key);
+        case 'set_apikey': {
+            let key = interaction.options.getString('key') ?? interaction.options.getString('apikey');
+            
+            if (!key) {
+                // 自動補完やキャッシュの問題で名前がずれている場合のフォールバック
+                const subCmd = interaction.options.data.find(opt => opt.name === 'set_apikey');
+                if (subCmd && subCmd.options && subCmd.options.length > 0) {
+                    const firstOpt = subCmd.options[0];
+                    if (typeof firstOpt.value === 'string') {
+                        key = firstOpt.value;
+                    }
+                }
+            }
+
+            if (!key) {
+                console.log("Failed to parse key from options:", JSON.stringify(interaction.options.data));
+                await interaction.reply({
+                    content: "❌ APIキーが正しく認識されませんでした。\\nDiscordの仕様により、入力欄(オプション枠)を選択してから文字を入力する必要があります。入力バーの上に出てくる `key` という枠を選択してから入力してください。",
+                    flags: MessageFlags.Ephemeral,
+                });
+                return;
+            }
+            if (!key.startsWith("AIza")) {
+                await interaction.reply({
+                    content: "❌ 無効なAPIキーの形式です。正しいキーを入力してください。",
+                    flags: MessageFlags.Ephemeral,
+                });
+                return;
+            }
+            setUserKey(interaction.user.id, key);
             await interaction.reply({
-                content:
-                    '✅ APIキーを更新しました。次回分析からこのキーが使用されます。',
+                content: '✅ APIキーを保存しました！\n以後、あなたがコマンドを実行するとこのキーが自動で使用されます。',
                 flags: MessageFlags.Ephemeral,
             });
             break;
         }
 
         case 'set_mode': {
-            const mode = interaction.options.getString('mode', true);
+            const mode = interaction.options.getString('mode');
+            if (!mode) {
+                await interaction.reply({ content: "❌ モードが指定されていません。", flags: MessageFlags.Ephemeral });
+                return;
+            }
             updateGuildSetting(guildId, 'analysis_mode', mode);
             await interaction.reply(
                 `✅ 分析モードを '${mode}' に変更しました。`
@@ -342,7 +437,11 @@ async function handleSettings(
         }
 
         case 'set_interval': {
-            const seconds = interaction.options.getInteger('seconds', true);
+            const seconds = interaction.options.getInteger('seconds');
+            if (seconds === null) {
+                await interaction.reply({ content: "❌ 秒数が指定されていません。", flags: MessageFlags.Ephemeral });
+                return;
+            }
             updateGuildSetting(guildId, 'recording_interval', seconds);
             await interaction.reply(
                 `✅ 分析間隔を ${seconds}秒 (${(seconds / 60).toFixed(1)}分) に変更しました。`
@@ -351,7 +450,11 @@ async function handleSettings(
         }
 
         case 'set_model': {
-            const model = interaction.options.getString('model', true);
+            const model = interaction.options.getString('model');
+            if (!model) {
+                await interaction.reply({ content: "❌ モデルが指定されていません。", flags: MessageFlags.Ephemeral });
+                return;
+            }
             updateGuildSetting(guildId, 'model_name', model);
             await interaction.reply(
                 `✅ 使用モデルを '${model}' に変更しました。`
@@ -365,10 +468,14 @@ async function handleModel(
     interaction: ChatInputCommandInteraction,
     guildId: string
 ): Promise<void> {
-    const model = interaction.options.getString('model', true);
+    const model = interaction.options.getString('model');
+    if (!model) {
+        await interaction.reply({ content: "❌ モデルが指定されていません。", flags: MessageFlags.Ephemeral });
+        return;
+    }
     updateGuildSetting(guildId, 'model_name', model);
     await interaction.reply(
-        `✅ 使用モデルを **${model}** に変更しました。`
+        `✅ 使用モデルを '${model}' に変更しました。`
     );
 }
 
@@ -418,8 +525,6 @@ async function handleCheck(
         `⏱️ **分析間隔**: ${interval}秒 (${(interval / 60).toFixed(1)}分)`,
         '',
         `🧠 **推論レベル**: 🔥 最高 (high)`,
-        '',
-        `🔑 **APIキー**: ${hasApiKey ? '✅ 設定済み (BYOK)' : '🌐 環境変数を使用'}`,
         '',
         `📡 **ステータス**: ${statusEmoji}`,
         '━━━━━━━━━━━━━━━━━━━━━━',

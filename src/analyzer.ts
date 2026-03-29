@@ -13,6 +13,8 @@ const PROMPTS: Record<string, string> = {
 1. 各ファイルの声とユーザー名を正確に紐付けてください。
 2. **Grounding (Google検索) は必須です**。議論の中で出た事実（例：「現在の失業率は〜」「〇〇というニュースがあった」）について、必ず検索機能を使用して最新情報を確認してください。
 3. 以前の発言と矛盾している点があれば指摘してください。
+4. **【重要】音声が無音、ノイズのみ、または意味のある会話が含まれていない場合は、無理に分析せず、「特に新しい議論はありませんでした。」とだけ出力してください。幻覚（ハルシネーション）を起こさないでください。**
+5. 「前回の文脈」はあくまで参考情報です。**今回提供された音声ファイルに含まれていない発言を、前回の文脈から捏造してレポートに含めないでください。**
 
 出力項目:
 【議論の要約】: (300字以内)
@@ -20,6 +22,8 @@ const PROMPTS: Record<string, string> = {
 【現在の対立構造】: (何がボトルネックで合意に至っていないか)
 【争点と矛盾・ファクトチェック】: (発言の矛盾点や、最新のネット情報と照らし合わせた誤りの指摘)
 【対立点の折衷案】: (対立点を解決するための折衷案の提案)
+
+**前置き・挨拶・自己紹介は一切不要です。上記の出力項目のみをそのまま出力してください。**
 `,
     summary: `
 あなたは会議の書記です。提供された音声ファイルを分析し、途中から参加した人でも状況がわかるような親切な要約を作成してください。
@@ -27,12 +31,16 @@ const PROMPTS: Record<string, string> = {
 分析ルール:
 1. 誰が何について話しているかを明確にしてください。
 2. 専門用語や文脈依存の単語には簡単な補足を加えてください。
+3. **【重要】音声が無音、ノイズのみ、または意味のある会話が含まれていない場合は、無理に分析せず、「特に新しい議論はありませんでした。」とだけ出力してください。**
+4. 「前回の文脈」はあくまで参考情報です。**今回提供された音声ファイルに含まれていない発言を、前回の文脈から捏造してレポートに含めないでください。**
 
 出力項目:
 【現在のトピック】: (今何を話しているか、数行でシンプルに)
 【これまでの流れ】: (時系列で主な発言と決定事項を箇条書き)
 【未解決の課題】: (まだ決まっていないこと、次に話すべきこと)
 【参加者の発言要旨】: (各参加者の主な主張)
+
+**前置き・挨拶・自己紹介は一切不要です。上記の出力項目のみをそのまま出力してください。**
 `,
 };
 
@@ -166,7 +174,20 @@ export async function analyzeDiscussion(
         const useModel = modelName || GEMINI_MODEL_FLASH;
         console.log(`[Analyzer] 使用モデル: ${useModel}`);
 
+        const isThinkingModel = useModel.includes('gemini-3.0') || useModel.includes('gemini-3.1');
+
         try {
+            const configObj: any = {
+                tools: [
+                    { googleSearch: {} },
+                ]
+            };
+            if (isThinkingModel) {
+                configObj.thinkingConfig = {
+                    thinkingLevel: 'HIGH' as any,
+                };
+            }
+
             const response = await ai.models.generateContent({
                 model: useModel,
                 contents: [
@@ -175,14 +196,7 @@ export async function analyzeDiscussion(
                         parts,
                     },
                 ],
-                config: {
-                    tools: [
-                        { googleSearch: {} },
-                    ],
-                    thinkingConfig: {
-                        thinkingLevel: 'HIGH' as any,
-                    },
-                },
+                config: configObj,
             });
 
             // クリーンアップ
@@ -196,6 +210,13 @@ export async function analyzeDiscussion(
             if (errStr.includes('429') || errStr.includes('Quota exceeded') || errStr.includes('RESOURCE_EXHAUSTED')) {
                 console.warn('Rate limited. Retrying without Google Search...');
                 try {
+                    const retryConfigObj: any = {};
+                    if (isThinkingModel) {
+                        retryConfigObj.thinkingConfig = {
+                            thinkingLevel: 'HIGH' as any,
+                        };
+                    }
+
                     const responseRetry = await ai.models.generateContent({
                         model: useModel,
                         contents: [
@@ -204,11 +225,7 @@ export async function analyzeDiscussion(
                                 parts,
                             },
                         ],
-                        config: {
-                            thinkingConfig: {
-                                thinkingLevel: 'HIGH' as any,
-                            },
-                        },
+                        config: retryConfigObj,
                     });
 
                     // クリーンアップ
@@ -234,7 +251,7 @@ export async function analyzeDiscussion(
         console.error(`Analysis Error: ${e}`);
         const errStr = String(e);
         if (errStr.includes('429') || errStr.includes('Quota exceeded')) {
-            return '⚠️ 分析のリクエスト制限（Quota Limit）に達しました。Google検索の使用が制限されている可能性があります。時間を置いて試してください。';
+            return '⚠️ 分析のリクエスト制限（Quota Limit）に達しました。';
         }
         return `分析中にエラーが発生しました: ${e}`;
     }

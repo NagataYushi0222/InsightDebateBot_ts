@@ -34,6 +34,14 @@ export function initDb(): void {
       model_name TEXT DEFAULT '${DEFAULT_MODEL}'
     )
   `);
+
+    conn.run(`
+    CREATE TABLE IF NOT EXISTS user_keys (
+      user_id TEXT PRIMARY KEY,
+      api_key TEXT,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
 }
 
 export function getGuildSettings(guildId: string): GuildSettings {
@@ -62,4 +70,18 @@ export function updateGuildSetting(guildId: string, key: keyof GuildSettings, va
     INSERT OR REPLACE INTO guild_settings (guild_id, api_key, analysis_mode, recording_interval, model_name)
     VALUES (?, ?, ?, ?, ?)
   `).run(guildId, settings.api_key, settings.analysis_mode, settings.recording_interval, settings.model_name);
+}
+
+export function getUserKey(userId: string): string | null {
+    const conn = getConnection();
+    const row = conn.prepare('SELECT api_key FROM user_keys WHERE user_id = ?').get(userId) as { api_key: string } | undefined;
+    return row ? row.api_key : null;
+}
+
+export function setUserKey(userId: string, apiKey: string): void {
+    const conn = getConnection();
+    conn.prepare(`
+    INSERT OR REPLACE INTO user_keys (user_id, api_key, updated_at)
+    VALUES (?, ?, CURRENT_TIMESTAMP)
+  `).run(userId, apiKey);
 }

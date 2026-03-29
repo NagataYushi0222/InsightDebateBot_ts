@@ -18,13 +18,15 @@ export class GuildSession {
     private bot: Client;
     public voiceConnection: VoiceConnection | null = null;
     private recorder: UserAudioRecorder | null = null;
-    private targetTextChannel: TextChannel | null = null;
+    public targetTextChannel: TextChannel | null = null;
     private lastContext: string = '';
-    private processLoopTimer: ReturnType<typeof setTimeout> | null = null;
-    private isRecording: boolean = false;
+    private isProcessLoopRunning: boolean = false;
+    public isRecording: boolean = false;
     private settings: GuildSettings;
     private opusDecoders: Map<string, OpusDecoder> = new Map();
     private subscribedUsers: Set<string> = new Set();
+    private apiKey: string | null = null;
+    private countdownMessage: any = null;
 
     constructor(guildId: string, bot: Client) {
         this.guildId = guildId;
@@ -37,12 +39,16 @@ export class GuildSession {
      */
     async startRecording(
         connection: VoiceConnection,
-        channel: TextChannel
+        channel: TextChannel,
+        apiKey: string | null = null,
+        initialMessage: any = null
     ): Promise<void> {
         this.voiceConnection = connection;
         this.targetTextChannel = channel;
         this.recorder = new UserAudioRecorder();
         this.isRecording = true;
+        this.apiKey = apiKey;
+        this.countdownMessage = initialMessage;
 
         // ボイス受信のセットアップ
         const receiver = connection.receiver;
@@ -94,19 +100,24 @@ export class GuildSession {
         });
 
         // 定期分析ループを開始
-        this.scheduleProcessLoop();
+        this.isProcessLoopRunning = true;
+        this.processLoop();
     }
 
     /**
      * 録音を停止する
      */
-    async stopRecording(): Promise<void> {
-        this.isRecording = false;
-
-        if (this.processLoopTimer) {
-            clearTimeout(this.processLoopTimer);
-            this.processLoopTimer = null;
+    async stopRecording(skipFinal: boolean = false): Promise<void> {
+        this.isProcessLoopRunning = false;
+        
+        if (!skipFinal && this.voiceConnection && this.isRecording && this.recorder) {
+            if (this.targetTextChannel) {
+                await this.targetTextChannel.send("🔄 終了前の最終分析を行っています...しばらくお待ちください。");
+            }
+            await this.processAudio(false, true);
         }
+
+        this.isRecording = false;
 
         // デコーダーのクリーンアップ
         this.opusDecoders.clear();
@@ -121,26 +132,73 @@ export class GuildSession {
     }
 
     /**
-     * 定期分析ループのスケジュール
+     * 定期分析ループ
      */
-    private scheduleProcessLoop(): void {
-        // 現在の設定を取得
-        this.settings = getGuildSettings(this.guildId);
-        const interval = (this.settings.recording_interval || 300) * 1000;
+    private async processLoop(): Promise<void> {
+        while (this.isProcessLoopRunning) {
+            this.settings = getGuildSettings(this.guildId);
+            const interval = this.settings.recording_interval || 300;
+            let remainingSeconds = interval;
 
-        this.processLoopTimer = setTimeout(async () => {
-            await this.processAudio(false);
-            // 次のループをスケジュール
-            if (this.isRecording) {
-                this.scheduleProcessLoop();
+            while (remainingSeconds > 0 && this.isProcessLoopRunning) {
+                try {
+                    const sleepTime = Math.min(60, remainingSeconds);
+                    await new Promise(resolve => setTimeout(resolve, sleepTime * 1000));
+                    remainingSeconds -= sleepTime;
+
+                    if (this.countdownMessage && remainingSeconds > 0) {
+                        try {
+                            const remainingMinutes = Math.max(1, Math.floor(remainingSeconds / 60));
+                            const content = this.countdownMessage.content;
+                            const lines = content.split('\n');
+                            const newLines = lines.filter((line: string) => !line.includes('⏳ 次のレポート出力まで:'));
+                            newLines.push(`⏳ 次のレポート出力まで: 約 ${remainingMinutes}分`);
+                            await this.countdownMessage.edit({ content: newLines.join('\n') });
+                        } catch (e) {
+                            // Message might be deleted
+                            this.countdownMessage = null;
+                        }
+                    }
+                } catch (e) {
+                    break;
+                }
             }
-        }, interval);
+
+            if (!this.isProcessLoopRunning) break;
+
+            await this.processAudio(false, false);
+
+            if (this.countdownMessage) {
+                try {
+                    const content = this.countdownMessage.content;
+                    const lines = content.split('\n');
+                    const newLines = lines.filter((line: string) => !line.includes('⏳ 次のレポート出力まで:'));
+                    const newContent = newLines.join('\n').trim();
+                    if (!newContent) {
+                        await this.countdownMessage.delete();
+                    } else {
+                        await this.countdownMessage.edit({ content: newContent });
+                    }
+                } catch (e) {
+                } finally {
+                    this.countdownMessage = null;
+                }
+            }
+
+            if (this.targetTextChannel && this.isProcessLoopRunning) {
+                try {
+                    const intervalMins = Math.floor(interval / 60);
+                    this.countdownMessage = await this.targetTextChannel.send(`⏳ 次のレポート出力まで: 約 ${intervalMins}分`);
+                } catch (e) {
+                }
+            }
+        }
     }
 
     /**
      * 蓄積された音声を分析する
      */
-    public async processAudio(isManual: boolean = false): Promise<void> {
+    public async processAudio(isManual: boolean = false, isFinal: boolean = false): Promise<void> {
         if (!this.recorder || !this.isRecording) return;
 
         const jobName = isManual ? 'Manual analysis' : 'Periodic analysis';
@@ -203,42 +261,91 @@ export class GuildSession {
                 return;
             }
 
-            // スレッドの作成とレポート送信
+                 // スレッドの作成とレポート送信
             const now = new Date();
-            const timestampStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-            const threadName = isManual
-                ? `手動分析レポート ${timestampStr}`
-                : `議論分析レポート ${timestampStr}`;
+            // JST (UTC+9) への変換処理
+            now.setHours(now.getUTCHours() + 9);
+            const timestampStr = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}-${String(now.getUTCDate()).padStart(2, '0')} ${String(now.getUTCHours()).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')}`;
+
+            let threadName = `議論分析レポート ${timestampStr}`;
+            let headerPrefix = '📊 **議論分析レポート**';
+            if (isFinal) {
+                threadName = `議論分析レポート (最終) ${timestampStr}`;
+                headerPrefix = '🏁 **最終分析レポート**';
+            } else if (isManual) {
+                threadName = `手動分析レポート ${timestampStr}`;
+                headerPrefix = '🚀 **手動分析レポート**';
+            }
 
             try {
                 if (!this.targetTextChannel) return;
+
+                const apiKeyToUse = this.apiKey;
+                if (!apiKeyToUse) {
+                    await this.targetTextChannel.send("⚠️ エラー: APIキーが設定されていません。");
+                    return;
+                }
 
                 // 分析実行（スレッド作成前に行う）
                 const report = await analyzeDiscussion(
                     userFilesMp3,
                     this.lastContext,
                     userMap,
-                    this.settings.api_key,
+                    apiKeyToUse,
                     this.settings.analysis_mode,
                     this.settings.model_name
                 );
 
+                if (!report || report.startsWith("⚠️") || report.startsWith("音声データがありません") || report.startsWith("❌")) {
+                    console.log(`[${this.guildId}] Analysis skipped or failed: ${report}`);
+                    let msg = "⚠️ 予期せぬエラーでレポートを作成できませんでした。";
+                    if (report.startsWith("音声データがありません")) {
+                        msg = "🎤 音声が検出されませんでした（無音）。";
+                    } else if (report.startsWith("⚠️") || report.startsWith("❌")) {
+                        msg = `⚠️ 分析エラー: ${report}`;
+                    }
+                    
+                    if (this.targetTextChannel) {
+                        await this.targetTextChannel.send(msg);
+                        if (isFinal) {
+                            await this.targetTextChannel.send("🛑 セッションを終了します。");
+                        }
+                    }
+                    return;
+                }
+
                 // コンテキストを更新
                 this.lastContext = report.slice(-2000);
 
-                const autoStr = isManual ? '手動分析' : '自動分析';
-                const starterMsg = await this.targetTextChannel.send(
-                    `📅 **${autoStr}** (${timestampStr})`
-                );
+                let titleText = `📅 自動分析 (${timestampStr})`;
+                let embedColor = 0x3498db; // Blue
+                if (isFinal) {
+                    titleText = `🛑 セッション終了 (${timestampStr})`;
+                    embedColor = 0xe74c3c; // Red
+                } else if (isManual) {
+                    titleText = `📅 手動分析 (${timestampStr})`;
+                }
+
+                const previewLength = 300;
+                let previewText = report.slice(0, previewLength).trim();
+                if (report.length > previewLength) {
+                    previewText += "...\n\n";
+                }
+
+                const embed = {
+                    title: titleText,
+                    description: `${previewText}\n*(全文はスレッドを開いてご確認ください)*`,
+                    color: embedColor
+                };
+
+                const starterMsg = await this.targetTextChannel.send({ embeds: [embed] });
                 const reportThread = await starterMsg.startThread({
                     name: threadName,
                     autoArchiveDuration: 60,
                 });
 
                 // レポートを投稿
-                const header = isManual
-                    ? '🚀 **手動分析レポート**\n'
-                    : '📊 **議論分析レポート**\n';
+                const header = `${headerPrefix}\n`;
                 if (report.length + header.length < 2000) {
                     await reportThread.send(header + report);
                 } else {
@@ -279,9 +386,9 @@ export class SessionManager {
         return this.sessions.get(guildId)!;
     }
 
-    async cleanupSession(guildId: string): Promise<void> {
+    async cleanupSession(guildId: string, skipFinal: boolean = false): Promise<void> {
         if (this.sessions.has(guildId)) {
-            await this.sessions.get(guildId)!.stopRecording();
+            await this.sessions.get(guildId)!.stopRecording(skipFinal);
             this.sessions.delete(guildId);
         }
     }
