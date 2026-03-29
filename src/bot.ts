@@ -308,7 +308,11 @@ async function handleAnalyzeStart(
         const interval = settings.recording_interval || 300;
         const intervalMins = Math.floor(interval / 60);
 
-        const initialMsgContent = `👥｜**${voiceChannel.name}** の分析を開始しました。\\nプライバシー保護のため、録音・分析が行われることを参加者に周知してください。\\n\`[設定] 間隔: ${intervalMins}分 / モード: ${mode}\`\\n\\n⏳ 次のレポート出力まで: 約 ${intervalMins}分`;
+        const initialMsgContent = `👥｜**${voiceChannel.name}** の分析を開始しました。
+プライバシー保護のため、録音・分析が行われることを参加者に周知してください。
+\`[設定] 間隔: ${intervalMins}分 / モード: ${mode}\`
+
+⏳ 次のレポート出力まで: 約 ${intervalMins}分`;
 
         const initialMessage = await interaction.followUp(initialMsgContent);
 
