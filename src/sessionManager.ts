@@ -472,11 +472,15 @@ export class GuildSession {
                 };
 
                 const starterMsg = await this.targetTextChannel.send({ embeds: [embed] });
-                this.currentStatus = this.isRecording ? '録音中' : '停止中';
-                this.currentTaskLabel = this.isRecording
-                    ? '次回の自動分析を待機中'
-                    : '録音は停止しています';
-                await this.replaceStatusMessage();
+                if (!isFinal) {
+                    this.currentStatus = this.isRecording ? '録音中' : '停止中';
+                    this.currentTaskLabel = this.isRecording
+                        ? '次回の自動分析を待機中'
+                        : '録音は停止しています';
+                    await this.replaceStatusMessage();
+                } else {
+                    await this.clearStatusMessage();
+                }
                 const reportThread = await starterMsg.startThread({
                     name: threadName,
                     autoArchiveDuration: 60,
@@ -511,7 +515,7 @@ export class GuildSession {
                 if (!isManual && !isFinal) {
                     this.cycleStartedAt = Date.now();
                 }
-            } else if (this.isRecording) {
+            } else if (this.isRecording && !isFinal) {
                 this.currentStatus = '録音中';
                 this.currentTaskLabel = '待機中';
             } else {
@@ -520,7 +524,11 @@ export class GuildSession {
                 this.cycleStartedAt = null;
             }
 
-            await this.refreshStatusMessage(undefined, true);
+            if (isFinal || !this.isRecording) {
+                await this.clearStatusMessage();
+            } else {
+                await this.refreshStatusMessage(undefined, true);
+            }
         }
     }
 }
