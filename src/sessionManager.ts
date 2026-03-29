@@ -135,6 +135,7 @@ export class GuildSession {
         this.currentStatus = '切断済み';
         this.currentTaskLabel = '接続が破棄されました';
         this.cycleStartedAt = null;
+        void this.clearStatusMessage();
 
         return true;
     }
@@ -173,7 +174,7 @@ export class GuildSession {
         }
 
         this.recorder = null;
-        await this.refreshStatusMessage();
+        await this.clearStatusMessage();
     }
 
     getRemainingSeconds(): number | null {
@@ -212,9 +213,12 @@ export class GuildSession {
             ? `${interval}秒 (${(interval / 60).toFixed(1)}分)`
             : `${interval}秒`;
         const remaining = this.getRemainingSeconds();
+        const headerLine = this.isRecording
+            ? `👥｜**${this.voiceChannelName}** の分析を実行中です。`
+            : `👥｜**${this.voiceChannelName}** の分析は停止しています。`;
 
         return [
-            `👥｜**${this.voiceChannelName}** の分析を実行中です。`,
+            headerLine,
             'プライバシー保護のため、録音・分析が行われることを参加者に周知してください。',
             `\`[設定] 間隔: ${intervalLabel} / モード: ${this.settings.analysis_mode}\``,
             `📡 現在の状態: **${this.currentStatus}**`,
@@ -223,19 +227,26 @@ export class GuildSession {
         ].join('\n');
     }
 
+    private async clearStatusMessage(): Promise<void> {
+        if (!this.statusMessage) {
+            this.lastStatusContent = '';
+            return;
+        }
+
+        try {
+            await this.statusMessage.delete();
+        } catch {
+            // ignore
+        } finally {
+            this.statusMessage = null;
+            this.lastStatusContent = '';
+        }
+    }
+
     private async replaceStatusMessage(): Promise<void> {
         const nextContent = this.buildStatusMessage();
 
-        if (this.statusMessage) {
-            try {
-                await this.statusMessage.delete();
-            } catch {
-                // ignore
-            } finally {
-                this.statusMessage = null;
-                this.lastStatusContent = '';
-            }
-        }
+        await this.clearStatusMessage();
 
         if (!this.targetTextChannel) return;
 
