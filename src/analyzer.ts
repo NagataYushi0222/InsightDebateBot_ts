@@ -2,6 +2,26 @@ import { GoogleGenAI, createUserContent, createPartFromUri } from '@google/genai
 import fs from 'fs';
 import { GEMINI_API_KEY, GEMINI_MODEL_FLASH } from './config';
 
+function extractGroundingUrls(response: any): string[] {
+    const chunks = response?.candidates?.[0]?.groundingMetadata?.groundingChunks;
+    if (!Array.isArray(chunks)) return [];
+
+    const urls = chunks
+        .map((chunk: any) => chunk?.web?.uri)
+        .filter((uri: unknown): uri is string => typeof uri === 'string' && uri.length > 0);
+
+    return Array.from(new Set(urls));
+}
+
+function appendGroundingUrls(reportText: string, response: any): string {
+    const urls = extractGroundingUrls(response);
+    const referenceSection = urls.length > 0
+        ? `【参考URL】\n${urls.map((url) => `- ${url}`).join('\n')}`
+        : '【参考URL】\n- Grounding は実行されましたが、参考URLを取得できませんでした。';
+
+    return `${reportText}\n\n${referenceSection}`;
+}
+
 /**
  * 分析プロンプト定義
  */
@@ -212,40 +232,9 @@ export async function analyzeDiscussion(
 
             // クリーンアップ
             for (const f of uploadedFiles) await ai.files.delete({ name: f.name }).catch(() => { });
-            return response.text || '分析結果が空でした。';
+            return appendGroundingUrls(response.text || '分析結果が空でした。', response);
 
         } catch (e: any) {
-            const errStr = String(e);
-
-            // 429エラーの場合、ツールなしでリトライ
-            if (errStr.includes('429') || errStr.includes('Quota exceeded') || errStr.includes('RESOURCE_EXHAUSTED')) {
-                console.warn('Rate limited. Retrying without Google Search...');
-                try {
-                    const retryConfigObj: any = {};
-                    if (isThinkingModel) {
-                        retryConfigObj.thinkingConfig = {
-                            thinkingLevel: 'HIGH' as any,
-                        };
-                    }
-
-                    const responseRetry = await ai.models.generateContent({
-                        model: useModel,
-                        contents: [
-                            {
-                                role: 'user',
-                                parts,
-                            },
-                        ],
-                        config: retryConfigObj,
-                    });
-
-                    // クリーンアップ
-                    for (const f of uploadedFiles) await ai.files.delete({ name: f.name }).catch(() => { });
-                    return (responseRetry.text || '分析結果が空でした。') + '\n\n(※ リクエスト制限のため、Google検索なしで生成しました)';
-                } catch (retryErr) {
-                    throw retryErr; // リトライも失敗したら投げる
-                }
-            }
             throw e;
         }
 
@@ -262,7 +251,7 @@ export async function analyzeDiscussion(
         console.error(`Analysis Error: ${e}`);
         const errStr = String(e);
         if (errStr.includes('429') || errStr.includes('Quota exceeded')) {
-            return '⚠️ 分析のリクエスト制限（Quota Limit）に達しました。';
+            return '⚠️ Grounding を含む分析のリクエスト制限（Quota Limit）に達しました。';
         }
         return `分析中にエラーが発生しました: ${e}`;
     }
