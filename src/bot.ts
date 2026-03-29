@@ -317,7 +317,8 @@ async function handleAnalyzeStart(
             connection,
             interaction.channel as TextChannel,
             userKey,
-            initialMessage
+            initialMessage,
+            voiceChannel.name
         );
     } catch (e) {
         if (session.hasActiveConnection()) {
@@ -448,6 +449,7 @@ async function handleSettings(
                 return;
             }
             updateGuildSetting(guildId, 'recording_interval', seconds);
+            await sessionManager.getSession(guildId).syncSettingsAndStatus();
             await interaction.reply(
                 `✅ 分析間隔を ${seconds}秒 (${(seconds / 60).toFixed(1)}分) に変更しました。`
             );
@@ -508,14 +510,16 @@ async function handleCheck(
     const settings = getGuildSettings(guildId);
     const session = sessionManager.getSession(guildId);
     const isRecording = session.hasActiveConnection();
+    const liveStatus = session.getStatusSummary();
 
     const modelName = settings.model_name || DEFAULT_MODEL;
     const modelDisplay = getModelDisplayName(modelName);
     const modeDisplay = getModeDisplayName(settings.analysis_mode || 'debate');
     const interval = settings.recording_interval || 300;
-    const hasApiKey = !!settings.api_key;
-
-    const statusEmoji = isRecording ? '🔴 録音中' : '⏹️ 停止中';
+    const remainingLabel = liveStatus.remainingSeconds === null
+        ? '停止中'
+        : `${Math.floor(liveStatus.remainingSeconds / 60)}分${liveStatus.remainingSeconds % 60}秒`;
+    const statusEmoji = isRecording ? '🔴' : '⏹️';
 
     const embed = [
         '━━━━━━━━━━━━━━━━━━━━━━',
@@ -531,7 +535,9 @@ async function handleCheck(
         '',
         `🧠 **推論レベル**: 🔥 最高 (high)`,
         '',
-        `📡 **ステータス**: ${statusEmoji}`,
+        `📡 **ステータス**: ${statusEmoji} ${liveStatus.status}`,
+        `🛠️ **現在の処理**: ${liveStatus.task}`,
+        `⏳ **次回レポートまで**: ${remainingLabel}`,
         '━━━━━━━━━━━━━━━━━━━━━━',
     ].join('\n');
 

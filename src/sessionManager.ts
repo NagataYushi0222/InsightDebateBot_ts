@@ -28,6 +28,12 @@ export class GuildSession {
     private subscribedUsers: Set<string> = new Set();
     private apiKey: string | null = null;
     private countdownMessage: any = null;
+    private voiceChannelName: string = '';
+    private cycleStartedAt: number | null = null;
+    private currentStatus: string = '停止中';
+    private currentTaskLabel: string = '待機中';
+    private lastStatusContent: string = '';
+    private isProcessingAudio: boolean = false;
 
     constructor(guildId: string, bot: Client) {
         this.guildId = guildId;
@@ -42,7 +48,8 @@ export class GuildSession {
         connection: VoiceConnection,
         channel: TextChannel,
         apiKey: string | null = null,
-        initialMessage: any = null
+        initialMessage: any = null,
+        voiceChannelName: string = 'Voice Channel'
     ): Promise<void> {
         this.voiceConnection = connection;
         this.targetTextChannel = channel;
@@ -50,6 +57,11 @@ export class GuildSession {
         this.isRecording = true;
         this.apiKey = apiKey;
         this.countdownMessage = initialMessage;
+        this.voiceChannelName = voiceChannelName;
+        this.cycleStartedAt = Date.now();
+        this.currentStatus = '録音中';
+        this.currentTaskLabel = '次回の自動分析を待機中';
+        await this.refreshStatusMessage();
 
         // ボイス受信のセットアップ
         const receiver = connection.receiver;
@@ -114,11 +126,15 @@ export class GuildSession {
 
         this.isProcessLoopRunning = false;
         this.isRecording = false;
+        this.isProcessingAudio = false;
         this.voiceConnection = null;
         this.recorder = null;
         this.opusDecoders.clear();
         this.subscribedUsers.clear();
         this.countdownMessage = null;
+        this.currentStatus = '切断済み';
+        this.currentTaskLabel = '接続が破棄されました';
+        this.cycleStartedAt = null;
 
         return true;
     }
@@ -128,6 +144,9 @@ export class GuildSession {
      */
     async stopRecording(skipFinal: boolean = false): Promise<void> {
         this.isProcessLoopRunning = false;
+        this.currentStatus = skipFinal ? '停止処理中' : '最終分析中';
+        this.currentTaskLabel = skipFinal ? '録音を停止しています' : '終了前の最終分析を準備しています';
+        await this.refreshStatusMessage();
         
         if (!skipFinal && this.voiceConnection && this.isRecording && this.recorder) {
             if (this.targetTextChannel) {
@@ -137,6 +156,10 @@ export class GuildSession {
         }
 
         this.isRecording = false;
+        this.isProcessingAudio = false;
+        this.cycleStartedAt = null;
+        this.currentStatus = '停止中';
+        this.currentTaskLabel = '録音は停止しています';
 
         // デコーダーのクリーンアップ
         this.opusDecoders.clear();
@@ -150,6 +173,79 @@ export class GuildSession {
         }
 
         this.recorder = null;
+        await this.refreshStatusMessage();
+    }
+
+    getRemainingSeconds(): number | null {
+        if (!this.isRecording || this.cycleStartedAt === null) return null;
+
+        const interval = getGuildSettings(this.guildId).recording_interval || 300;
+        const elapsed = Math.floor((Date.now() - this.cycleStartedAt) / 1000);
+        return Math.max(0, interval - elapsed);
+    }
+
+    getStatusSummary(): { status: string; task: string; remainingSeconds: number | null } {
+        return {
+            status: this.currentStatus,
+            task: this.currentTaskLabel,
+            remainingSeconds: this.getRemainingSeconds(),
+        };
+    }
+
+    async syncSettingsAndStatus(): Promise<void> {
+        this.settings = getGuildSettings(this.guildId);
+        await this.refreshStatusMessage();
+    }
+
+    private formatRemaining(seconds: number | null): string {
+        if (seconds === null) return '停止中';
+
+        const mins = Math.floor(seconds / 60);
+        const secs = seconds % 60;
+        return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+    }
+
+    private buildStatusMessage(): string {
+        this.settings = getGuildSettings(this.guildId);
+        const interval = this.settings.recording_interval || 300;
+        const intervalLabel = interval >= 60
+            ? `${interval}秒 (${(interval / 60).toFixed(1)}分)`
+            : `${interval}秒`;
+        const remaining = this.getRemainingSeconds();
+
+        return [
+            `👥｜**${this.voiceChannelName}** の分析を実行中です。`,
+            'プライバシー保護のため、録音・分析が行われることを参加者に周知してください。',
+            `\`[設定] 間隔: ${intervalLabel} / モード: ${this.settings.analysis_mode}\``,
+            `📡 現在の状態: **${this.currentStatus}**`,
+            `🛠️ 現在の処理: ${this.currentTaskLabel}`,
+            `⏳ 次のレポート出力まで: ${this.formatRemaining(remaining)}`,
+        ].join('\n');
+    }
+
+    private async refreshStatusMessage(force: boolean = false): Promise<void> {
+        const nextContent = this.buildStatusMessage();
+        if (!force && nextContent === this.lastStatusContent) return;
+
+        if (!this.countdownMessage && this.targetTextChannel) {
+            try {
+                this.countdownMessage = await this.targetTextChannel.send(nextContent);
+                this.lastStatusContent = nextContent;
+                return;
+            } catch {
+                return;
+            }
+        }
+
+        if (!this.countdownMessage) return;
+
+        try {
+            await this.countdownMessage.edit({ content: nextContent });
+            this.lastStatusContent = nextContent;
+        } catch {
+            this.countdownMessage = null;
+            this.lastStatusContent = '';
+        }
     }
 
     /**
@@ -157,29 +253,22 @@ export class GuildSession {
      */
     private async processLoop(): Promise<void> {
         while (this.isProcessLoopRunning) {
-            this.settings = getGuildSettings(this.guildId);
-            const interval = this.settings.recording_interval || 300;
-            let remainingSeconds = interval;
+            this.cycleStartedAt = Date.now();
+            this.currentStatus = '録音中';
+            this.currentTaskLabel = '次回の自動分析を待機中';
+            await this.refreshStatusMessage(true);
 
-            while (remainingSeconds > 0 && this.isProcessLoopRunning) {
+            while (this.isProcessLoopRunning) {
                 try {
-                    const sleepTime = Math.min(60, remainingSeconds);
-                    await new Promise(resolve => setTimeout(resolve, sleepTime * 1000));
-                    remainingSeconds -= sleepTime;
+                    this.settings = getGuildSettings(this.guildId);
+                    const remainingSeconds = this.getRemainingSeconds();
+                    await this.refreshStatusMessage();
 
-                    if (this.countdownMessage && remainingSeconds > 0) {
-                        try {
-                            const remainingMinutes = Math.max(1, Math.floor(remainingSeconds / 60));
-                            const content = this.countdownMessage.content;
-                            const lines = content.split('\n');
-                            const newLines = lines.filter((line: string) => !line.includes('⏳ 次のレポート出力まで:'));
-                            newLines.push(`⏳ 次のレポート出力まで: 約 ${remainingMinutes}分`);
-                            await this.countdownMessage.edit({ content: newLines.join('\n') });
-                        } catch (e) {
-                            // Message might be deleted
-                            this.countdownMessage = null;
-                        }
+                    if (remainingSeconds !== null && remainingSeconds <= 0) {
+                        break;
                     }
+
+                    await new Promise(resolve => setTimeout(resolve, 5000));
                 } catch (e) {
                     break;
                 }
@@ -188,31 +277,6 @@ export class GuildSession {
             if (!this.isProcessLoopRunning) break;
 
             await this.processAudio(false, false);
-
-            if (this.countdownMessage) {
-                try {
-                    const content = this.countdownMessage.content;
-                    const lines = content.split('\n');
-                    const newLines = lines.filter((line: string) => !line.includes('⏳ 次のレポート出力まで:'));
-                    const newContent = newLines.join('\n').trim();
-                    if (!newContent) {
-                        await this.countdownMessage.delete();
-                    } else {
-                        await this.countdownMessage.edit({ content: newContent });
-                    }
-                } catch (e) {
-                } finally {
-                    this.countdownMessage = null;
-                }
-            }
-
-            if (this.targetTextChannel && this.isProcessLoopRunning) {
-                try {
-                    const intervalMins = Math.floor(interval / 60);
-                    this.countdownMessage = await this.targetTextChannel.send(`⏳ 次のレポート出力まで: 約 ${intervalMins}分`);
-                } catch (e) {
-                }
-            }
         }
     }
 
@@ -221,14 +285,26 @@ export class GuildSession {
      */
     public async processAudio(isManual: boolean = false, isFinal: boolean = false): Promise<void> {
         if (!this.recorder || !this.isRecording) return;
+        if (this.isProcessingAudio) return;
+
+        this.isProcessingAudio = true;
 
         const jobName = isManual ? 'Manual analysis' : 'Periodic analysis';
         console.log(`[${this.guildId}] Starting ${jobName}...`);
 
         try {
+            this.currentStatus = isFinal ? '最終分析中' : isManual ? '手動分析中' : '自動分析中';
+            this.currentTaskLabel = '音声を確定しています';
+            await this.refreshStatusMessage(true);
+
             const userFilesRaw = await this.recorder.flushAudio();
 
-            if (userFilesRaw.size === 0) return;
+            if (userFilesRaw.size === 0) {
+                this.currentStatus = '録音中';
+                this.currentTaskLabel = isManual ? '新しい音声がなかったため待機中' : '次回の自動分析を待機中';
+                await this.refreshStatusMessage(true);
+                return;
+            }
 
             // ユーザー名マッピング
             const userMap = new Map<string, string>();
@@ -268,6 +344,8 @@ export class GuildSession {
             // PCM → MP3 変換
             const userFilesMp3 = new Map<string, string>();
             const filesToCleanup: string[] = Array.from(userFilesRaw.values());
+            this.currentTaskLabel = 'エンコード中';
+            await this.refreshStatusMessage(true);
 
             for (const [userId, rawPath] of userFilesRaw.entries()) {
                 const mp3Path = convertToMp3(rawPath);
@@ -308,6 +386,8 @@ export class GuildSession {
                 }
 
                 // 分析実行（スレッド作成前に行う）
+                this.currentTaskLabel = '回答生成中';
+                await this.refreshStatusMessage(true);
                 const report = await analyzeDiscussion(
                     userFilesMp3,
                     this.lastContext,
@@ -337,6 +417,8 @@ export class GuildSession {
 
                 // コンテキストを更新
                 this.lastContext = report.slice(-2000);
+                this.currentTaskLabel = 'レポート投稿中';
+                await this.refreshStatusMessage(true);
 
                 let titleText = `📅 自動分析 (${timestampStr})`;
                 let embedColor = 0x3498db; // Blue
@@ -385,6 +467,25 @@ export class GuildSession {
             }
         } catch (e) {
             console.error(`[${this.guildId}] Error in processAudio:`, e);
+        } finally {
+            this.isProcessingAudio = false;
+
+            if (this.isRecording && this.isProcessLoopRunning) {
+                this.currentStatus = '録音中';
+                this.currentTaskLabel = '次回の自動分析を待機中';
+                if (!isManual && !isFinal) {
+                    this.cycleStartedAt = Date.now();
+                }
+            } else if (this.isRecording) {
+                this.currentStatus = '録音中';
+                this.currentTaskLabel = '待機中';
+            } else {
+                this.currentStatus = '停止中';
+                this.currentTaskLabel = '録音は停止しています';
+                this.cycleStartedAt = null;
+            }
+
+            await this.refreshStatusMessage(true);
         }
     }
 }
