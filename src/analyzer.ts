@@ -11,10 +11,12 @@ const PROMPTS: Record<string, string> = {
 
 分析ルール:
 1. 各ファイルの声とユーザー名を正確に紐付けてください。
+1.5. **各音声ファイルの直前に書かれた「発言者ラベル」が、そのファイルの唯一の話者です。別ファイルの発言をその人に混ぜないでください。話者が確信できない内容は「不明」としてください。**
 2. **Grounding (Google検索) は必須です**。議論の中で出た事実（例：「現在の失業率は〜」「〇〇というニュースがあった」）について、必ず検索機能を使用して最新情報を確認してください。
 3. 以前の発言と矛盾している点があれば指摘してください。
 4. **【重要】音声が無音、ノイズのみ、または意味のある会話が含まれていない場合は、無理に分析せず、「特に新しい議論はありませんでした。」とだけ出力してください。幻覚（ハルシネーション）を起こさないでください。**
 5. 「前回の文脈」はあくまで参考情報です。**今回提供された音声ファイルに含まれていない発言を、前回の文脈から捏造してレポートに含めないでください。**
+6. **ある参加者の発言を別の参加者に割り当てることは禁止です。**
 
 出力項目:
 【議論の要約】: (300字以内)
@@ -30,9 +32,11 @@ const PROMPTS: Record<string, string> = {
 
 分析ルール:
 1. 誰が何について話しているかを明確にしてください。
+1.5. **各音声ファイルの直前に書かれた「発言者ラベル」が、そのファイルの唯一の話者です。別ファイルの発言をその人に混ぜないでください。話者が確信できない内容は「不明」としてください。**
 2. 専門用語や文脈依存の単語には簡単な補足を加えてください。
 3. **【重要】音声が無音、ノイズのみ、または意味のある会話が含まれていない場合は、無理に分析せず、「特に新しい議論はありませんでした。」とだけ出力してください。**
 4. 「前回の文脈」はあくまで参考情報です。**今回提供された音声ファイルに含まれていない発言を、前回の文脈から捏造してレポートに含めないでください。**
+5. **ある参加者の発言を別の参加者に割り当てることは禁止です。**
 
 出力項目:
 【現在のトピック】: (今何を話しているか、数行でシンプルに)
@@ -142,6 +146,13 @@ export async function analyzeDiscussion(
     }
 
     // 音声ファイルをアップロードして追加
+    parts.push({
+        text: `今回の参加者一覧:\n${Array.from(audioFilesMap.keys()).map((userId, index) => {
+            const userName = userMap?.get(userId) || `User_${userId}`;
+            return `${index + 1}. ${userName} [ID:${userId}]`;
+        }).join('\n')}`,
+    });
+
     for (const [userId, filePath] of audioFilesMap.entries()) {
         if (!fs.existsSync(filePath)) continue;
 
@@ -151,7 +162,7 @@ export async function analyzeDiscussion(
             const uploadedFile = await uploadToGemini(ai, filePath);
             uploadedFiles.push(uploadedFile);
 
-            parts.push({ text: `発言者: ${userName}` });
+            parts.push({ text: `発言者ラベル: ${userName} [ID:${userId}]` });
             parts.push({
                 fileData: {
                     fileUri: uploadedFile.uri,

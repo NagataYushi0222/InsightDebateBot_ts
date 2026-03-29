@@ -43,24 +43,38 @@ export class UserAudioRecorder {
      * 現在書き込み中のファイルをクローズし、パスを返却する
      * 次回の書き込み書き込み時に新しいファイルが作成される
      */
-    flushAudio(): Map<string, string> {
+    async flushAudio(): Promise<Map<string, string>> {
         const flushedFiles = new Map<string, string>();
+        const closePromises: Promise<void>[] = [];
 
         for (const [userId, stream] of this.writeStreams.entries()) {
-            // ストリームを閉じる
-            stream.end();
-
             const filePath = this.activeFilePaths.get(userId);
-            if (filePath && fs.existsSync(filePath) && fs.statSync(filePath).size > 0) {
+
+            closePromises.push(new Promise((resolve) => {
+                stream.once('close', resolve);
+                stream.once('finish', resolve);
+                stream.end();
+            }));
+
+            if (filePath) {
                 flushedFiles.set(userId, filePath);
             }
         }
+
+        await Promise.all(closePromises);
 
         // マップをクリア（次回の write で新規作成させる）
         this.writeStreams.clear();
         this.activeFilePaths.clear();
 
-        return flushedFiles;
+        const existingFiles = new Map<string, string>();
+        for (const [userId, filePath] of flushedFiles.entries()) {
+            if (fs.existsSync(filePath) && fs.statSync(filePath).size > 0) {
+                existingFiles.set(userId, filePath);
+            }
+        }
+
+        return existingFiles;
     }
 
     /**

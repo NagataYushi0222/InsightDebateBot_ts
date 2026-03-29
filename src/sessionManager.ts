@@ -226,7 +226,7 @@ export class GuildSession {
         console.log(`[${this.guildId}] Starting ${jobName}...`);
 
         try {
-            const userFilesRaw = this.recorder.flushAudio();
+            const userFilesRaw = await this.recorder.flushAudio();
 
             if (userFilesRaw.size === 0) return;
 
