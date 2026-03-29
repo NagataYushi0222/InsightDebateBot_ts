@@ -9,6 +9,8 @@ function getConnection(): Database {
     if (!db) {
         db = new Database(DB_PATH);
         db.run('PRAGMA journal_mode = WAL');
+        db.run('PRAGMA busy_timeout = 5000');
+        db.run('PRAGMA synchronous = NORMAL');
     }
     return db;
 }
@@ -62,14 +64,22 @@ export function getGuildSettings(guildId: string): GuildSettings {
 }
 
 export function updateGuildSetting(guildId: string, key: keyof GuildSettings, value: string | number | null): void {
-    const settings = getGuildSettings(guildId);
-    (settings as any)[key] = value;
-
     const conn = getConnection();
+    const allowedKeys: Array<keyof GuildSettings> = [
+        'api_key',
+        'analysis_mode',
+        'recording_interval',
+        'model_name',
+    ];
+    if (!allowedKeys.includes(key)) {
+        throw new Error(`Unsupported guild setting key: ${key}`);
+    }
+
     conn.prepare(`
-    INSERT OR REPLACE INTO guild_settings (guild_id, api_key, analysis_mode, recording_interval, model_name)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(guildId, settings.api_key, settings.analysis_mode, settings.recording_interval, settings.model_name);
+    INSERT INTO guild_settings (guild_id, ${key})
+    VALUES (?, ?)
+    ON CONFLICT(guild_id) DO UPDATE SET ${key} = excluded.${key}
+  `).run(guildId, value);
 }
 
 export function getUserKey(userId: string): string | null {
