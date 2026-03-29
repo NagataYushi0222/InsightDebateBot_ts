@@ -15,6 +15,10 @@ function extractGroundingUrls(response: any): string[] {
 
 function appendGroundingUrls(reportText: string, response: any): string {
     const urls = extractGroundingUrls(response);
+    if (reportText.includes('【参考URL】')) {
+        return reportText;
+    }
+
     const referenceSection = urls.length > 0
         ? `【参考URL】\n${urls.map((url) => `- ${url}`).join('\n')}`
         : '【参考URL】\n- Grounding は実行されましたが、参考URLを取得できませんでした。';
@@ -44,6 +48,7 @@ const PROMPTS: Record<string, string> = {
 【現在の対立構造】: (何がボトルネックで合意に至っていないか)
 【争点と矛盾・ファクトチェック】: (発言の矛盾点や、最新のネット情報と照らし合わせた誤りの指摘)
 【対立点の折衷案】: (対立点を解決するための折衷案の提案)
+【参考URL】: (Grounding で参照したURLを箇条書きで必ず列挙。最低1件。URLは省略せずフルで書く)
 
 **前置き・挨拶・自己紹介は一切不要です。上記の出力項目のみをそのまま出力してください。**
 `,
@@ -63,6 +68,7 @@ const PROMPTS: Record<string, string> = {
 【これまでの流れ】: (時系列で主な発言と決定事項を箇条書き)
 【未解決の課題】: (まだ決まっていないこと、次に話すべきこと)
 【参加者の発言要旨】: (各参加者の主な主張)
+【参考URL】: (Grounding で参照したURLを箇条書きで必ず列挙。最低1件。URLは省略せずフルで書く)
 
 **前置き・挨拶・自己紹介は一切不要です。上記の出力項目のみをそのまま出力してください。**
 `,
