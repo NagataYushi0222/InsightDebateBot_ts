@@ -31,6 +31,7 @@ import {
 } from './database';
 import { SessionManager } from './sessionManager';
 import { VcArticleSessionManager } from './vcArticle/sessionManager';
+import { ArchivedSessionSummary, listArchivedSessions } from './vcArticle/storage';
 
 initDb();
 
@@ -74,6 +75,28 @@ const commands = [
     new SlashCommandBuilder()
         .setName('article_topics')
         .setDescription('直近のVC記事化トピック一覧を再表示します'),
+
+    new SlashCommandBuilder()
+        .setName('article_archives')
+        .setDescription('保存済みのVC音声セッション一覧を表示します')
+        .addIntegerOption((opt) =>
+            opt
+                .setName('limit')
+                .setDescription('表示件数')
+                .setRequired(false)
+                .setMinValue(1)
+                .setMaxValue(30)
+        ),
+
+    new SlashCommandBuilder()
+        .setName('article_load')
+        .setDescription('保存済みのVC音声セッションを選択してトピック抽出します')
+        .addStringOption((opt) =>
+            opt
+                .setName('archive_id')
+                .setDescription('読み込みたい保存済みセッションID')
+                .setRequired(true)
+        ),
 
     new SlashCommandBuilder()
         .setName('article_write')
@@ -220,6 +243,12 @@ client.on('interactionCreate', async (interaction) => {
                 break;
             case 'article_topics':
                 await handleArticleTopics(interaction, guildId);
+                break;
+            case 'article_archives':
+                await handleArticleArchives(interaction, guildId);
+                break;
+            case 'article_load':
+                await handleArticleLoad(interaction, guildId);
                 break;
             case 'article_write':
                 await handleArticleWrite(interaction, guildId);
@@ -520,7 +549,8 @@ async function handleArticleStart(
         connection,
         interaction.channel as TextChannel,
         interaction.guild!,
-        userKey
+        userKey,
+        voiceChannel.name
     );
 
     await interaction.followUp(
@@ -547,7 +577,7 @@ async function handleArticleStop(
     await interaction.deferReply();
     await interaction.followUp('🔄 録音を停止し、記事候補トピックを抽出しています...');
     const topicResult = await articleSession.stopAndExtractTopics();
-    await followUpInChunks(interaction, formatTopicsMessage(topicResult));
+    await followUpInChunks(interaction, formatTopicsMessage(topicResult, articleSession.getActiveArchiveId()));
 }
 
 async function handleArticleTopics(
@@ -563,7 +593,54 @@ async function handleArticleTopics(
         return;
     }
 
-    await replyInChunks(interaction, formatTopicsMessage(topicResult));
+    await replyInChunks(interaction, formatTopicsMessage(topicResult, vcArticleManager.getSession(guildId).getActiveArchiveId()));
+}
+
+async function handleArticleArchives(
+    interaction: ChatInputCommandInteraction,
+    guildId: string
+): Promise<void> {
+    const limit = interaction.options.getInteger('limit') ?? 10;
+    const archives = listArchivedSessions(limit, guildId);
+
+    await replyInChunks(interaction, formatArchiveListMessage(archives));
+}
+
+async function handleArticleLoad(
+    interaction: ChatInputCommandInteraction,
+    guildId: string
+): Promise<void> {
+    const archiveId = interaction.options.getString('archive_id', true).trim();
+    const userKey = getUserKey(interaction.user.id);
+    if (!userKey) {
+        await interaction.reply({
+            content: '❌ APIキーが設定されていません。\n`/settings set_apikey [あなたのキー]` を実行してください。',
+            flags: MessageFlags.Ephemeral,
+        });
+        return;
+    }
+
+    if (sessionManager.getSession(guildId).hasActiveConnection()) {
+        await interaction.reply({
+            content: '通常の分析が実行中です。先に `/analyze_stop` または `/analyze_stop_final` を実行してください。',
+            flags: MessageFlags.Ephemeral,
+        });
+        return;
+    }
+
+    const articleSession = vcArticleManager.getSession(guildId);
+    if (articleSession.hasActiveConnection()) {
+        await interaction.reply({
+            content: '記事化用の録音が実行中です。先に `/article_stop` を実行してください。',
+            flags: MessageFlags.Ephemeral,
+        });
+        return;
+    }
+
+    await interaction.deferReply();
+    await interaction.followUp(`📂 保存済み音声 ${archiveId} を読み込み、記事候補を抽出しています...`);
+    const topicResult = await articleSession.loadArchiveAndExtractTopics(archiveId, userKey);
+    await followUpInChunks(interaction, formatTopicsMessage(topicResult, articleSession.getActiveArchiveId()));
 }
 
 async function handleArticleWrite(
@@ -593,7 +670,7 @@ async function handleArticleDiscard(
 ): Promise<void> {
     await vcArticleManager.cleanupSession(guildId);
     await interaction.reply({
-        content: '🧹 記事化用の録音・キャッシュを破棄しました。',
+        content: '🧹 現在の録音・選択中キャッシュを破棄しました。保存済み音声ファイル自体は残ります。',
         flags: MessageFlags.Ephemeral,
     });
 }
@@ -736,6 +813,8 @@ async function handleCheck(
         : articleSession.hasTopicCache()
             ? '🗂️ 記事トピック保持中'
             : '⏹️ 記事化停止中';
+    const activeArchiveId = articleSession.getActiveArchiveId() || 'なし';
+    const activeArchiveLabel = articleSession.getActiveArchiveLabel() || 'なし';
 
     const embed = [
         '━━━━━━━━━━━━━━━━━━━━━━',
@@ -753,6 +832,8 @@ async function handleCheck(
         `🛠️ **要約Bot処理**: ${liveStatus.task}`,
         `⏳ **次回レポートまで**: ${remainingLabel}`,
         `📰 **記事化機能状態**: ${articleStatus}`,
+        `🗂️ **選択中アーカイブ**: ${activeArchiveId}`,
+        `📝 **選択中タイトル**: ${activeArchiveLabel}`,
         '━━━━━━━━━━━━━━━━━━━━━━',
     ].join('\n');
 
@@ -762,20 +843,26 @@ async function handleCheck(
     });
 }
 
-function formatTopicsMessage(topicResult: { sessionSummary: string; topics: Array<{ id: number; title: string; summary: string; reason: string; speakers: string[]; includesTextChat: boolean; }> }): string {
+function formatTopicsMessage(
+    topicResult: { sessionSummary: string; topics: Array<{ id: number; title: string; summary: string; reason: string; speakers: string[]; includesTextChat: boolean; }> },
+    archiveId: string | null = null
+): string {
     if (topicResult.topics.length === 0) {
         return [
             '📰 **記事候補トピックを抽出しました**',
             '',
+            archiveId ? `保存ID: ${archiveId}` : '',
+            archiveId ? '' : '',
             `概要: ${topicResult.sessionSummary || '有効な会話を十分に抽出できませんでした。'}`,
             '',
             '記事化に向いたトピックは見つかりませんでした。',
-        ].join('\n');
+        ].filter(Boolean).join('\n');
     }
 
     const lines = [
         '📰 **記事候補トピックを抽出しました**',
         '',
+        ...(archiveId ? [`保存ID: ${archiveId}`, ''] : []),
         `概要: ${topicResult.sessionSummary || '会話全体の概要なし'}`,
         '',
     ];
@@ -792,6 +879,49 @@ function formatTopicsMessage(topicResult: { sessionSummary: string; topics: Arra
 
     lines.push('記事化するには `/article_write topic:<番号>` を実行してください。');
     return lines.join('\n');
+}
+
+function formatArchiveListMessage(archives: ArchivedSessionSummary[]): string {
+    if (archives.length === 0) {
+        return [
+            '📂 **保存済みVC音声一覧**',
+            '',
+            '保存済みの音声セッションはありません。',
+        ].join('\n');
+    }
+
+    const lines = [
+        '📂 **保存済みVC音声一覧**',
+        '',
+        '読み込みには `/article_load archive_id:<ID>` を使ってください。',
+        '',
+    ];
+
+    for (const archive of archives) {
+        lines.push(`- タイトル: ${archive.summaryLabel || '(未解析)'}`);
+        lines.push(`- ID: \`${archive.archiveId}\``);
+        lines.push(`  日時: ${formatArchiveDate(archive.createdAt)} / VC: ${archive.voiceChannelName}`);
+        lines.push(`  音声: ${archive.fileCount}ファイル / 話者: ${archive.speakerCount}人 / チャット: ${archive.textEntryCount}件 / 容量: ${formatBytes(archive.totalBytes)}`);
+    }
+
+    return lines.join('\n');
+}
+
+function formatArchiveDate(isoString: string): string {
+    const date = new Date(isoString);
+    const y = date.getFullYear();
+    const m = String(date.getMonth() + 1).padStart(2, '0');
+    const d = String(date.getDate()).padStart(2, '0');
+    const hh = String(date.getHours()).padStart(2, '0');
+    const mm = String(date.getMinutes()).padStart(2, '0');
+    return `${y}-${m}-${d} ${hh}:${mm}`;
+}
+
+function formatBytes(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
 function splitForDiscord(content: string, maxLength: number = 1900): string[] {

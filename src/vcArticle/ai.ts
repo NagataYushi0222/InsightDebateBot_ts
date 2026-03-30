@@ -2,6 +2,7 @@ import fs from 'fs';
 import { GoogleGenAI } from '@google/genai';
 import { GEMINI_API_KEY, GEMINI_MODEL_FLASH } from '../config';
 import { ARTICLE_GENERATION_PROMPT, TOPIC_EXTRACTION_PROMPT } from './prompts';
+import { StoredAudioClip } from './storage';
 import { ArticleTopic, TextChatEntry, TopicExtractionResult } from './types';
 
 function stripCodeFence(text: string): string {
@@ -63,16 +64,25 @@ function createAiClient(apiKey: string | null): GoogleGenAI {
     return new GoogleGenAI({ apiKey: useKey });
 }
 
+function buildParticipantMap(audioClips: StoredAudioClip[]): Map<string, string> {
+    const participantMap = new Map<string, string>();
+    for (const clip of audioClips) {
+        if (!participantMap.has(clip.userId)) {
+            participantMap.set(clip.userId, clip.displayName);
+        }
+    }
+    return participantMap;
+}
+
 function buildSharedParts(
-    audioFilesMap: Map<string, string>,
-    userMap: Map<string, string>,
+    audioClips: StoredAudioClip[],
     textEntries: TextChatEntry[]
 ): any[] {
     const parts: any[] = [];
+    const participantMap = buildParticipantMap(audioClips);
 
     parts.push({
-        text: `参加者一覧:\n${Array.from(audioFilesMap.keys()).map((userId, index) => {
-            const name = userMap.get(userId) || `User_${userId}`;
+        text: `参加者一覧:\n${Array.from(participantMap.entries()).map(([userId, name], index) => {
             return `${index + 1}. ${name} [ID:${userId}]`;
         }).join('\n')}`,
     });
@@ -93,20 +103,19 @@ function buildSharedParts(
 
 async function uploadAudioParts(
     ai: GoogleGenAI,
-    audioFilesMap: Map<string, string>,
-    userMap: Map<string, string>
+    audioClips: StoredAudioClip[]
 ): Promise<{ uploadedFiles: any[]; audioParts: any[] }> {
     const uploadedFiles: any[] = [];
     const audioParts: any[] = [];
 
-    for (const [userId, filePath] of audioFilesMap.entries()) {
+    for (const clip of audioClips) {
+        const { userId, displayName, filePath, clipId } = clip;
         if (!fs.existsSync(filePath)) continue;
 
-        const userName = userMap.get(userId) || `User_${userId}`;
         const uploadedFile = await uploadToGemini(ai, filePath);
         uploadedFiles.push(uploadedFile);
 
-        audioParts.push({ text: `発言者ラベル: ${userName} [ID:${userId}]` });
+        audioParts.push({ text: `発言者ラベル: ${displayName} [ID:${userId}] / 断片ID: ${clipId}` });
         audioParts.push({
             fileData: {
                 fileUri: uploadedFile.uri,
@@ -127,19 +136,18 @@ async function cleanupUploads(ai: GoogleGenAI, uploadedFiles: any[]): Promise<vo
 }
 
 export async function extractArticleTopics(
-    audioFilesMap: Map<string, string>,
-    userMap: Map<string, string>,
+    audioClips: StoredAudioClip[],
     textEntries: TextChatEntry[],
     apiKey: string | null,
     modelName: string | null
 ): Promise<TopicExtractionResult> {
-    if (audioFilesMap.size === 0) {
+    if (audioClips.length === 0) {
         return { sessionSummary: '録音データがありませんでした。', topics: [] };
     }
 
     const ai = createAiClient(apiKey);
     const useModel = modelName || GEMINI_MODEL_FLASH;
-    const { uploadedFiles, audioParts } = await uploadAudioParts(ai, audioFilesMap, userMap);
+    const { uploadedFiles, audioParts } = await uploadAudioParts(ai, audioClips);
 
     if (uploadedFiles.length === 0) {
         return { sessionSummary: '音声ファイルの準備に失敗しました。', topics: [] };
@@ -155,7 +163,7 @@ export async function extractArticleTopics(
                     role: 'user',
                     parts: [
                         { text: TOPIC_EXTRACTION_PROMPT },
-                        ...buildSharedParts(audioFilesMap, userMap, textEntries),
+                        ...buildSharedParts(audioClips, textEntries),
                         ...audioParts,
                     ],
                 },
@@ -172,20 +180,19 @@ export async function extractArticleTopics(
 }
 
 export async function generateArticleFromTopic(
-    audioFilesMap: Map<string, string>,
-    userMap: Map<string, string>,
+    audioClips: StoredAudioClip[],
     textEntries: TextChatEntry[],
     topic: ArticleTopic,
     apiKey: string | null,
     modelName: string | null
 ): Promise<string> {
-    if (audioFilesMap.size === 0) {
+    if (audioClips.length === 0) {
         return '記事生成に必要な音声データがありません。';
     }
 
     const ai = createAiClient(apiKey);
     const useModel = modelName || GEMINI_MODEL_FLASH;
-    const { uploadedFiles, audioParts } = await uploadAudioParts(ai, audioFilesMap, userMap);
+    const { uploadedFiles, audioParts } = await uploadAudioParts(ai, audioClips);
 
     if (uploadedFiles.length === 0) {
         return '記事生成に必要な音声ファイルの準備に失敗しました。';
@@ -204,7 +211,7 @@ export async function generateArticleFromTopic(
                         {
                             text: `選択されたトピック:\n${JSON.stringify(topic, null, 2)}`,
                         },
-                        ...buildSharedParts(audioFilesMap, userMap, textEntries),
+                        ...buildSharedParts(audioClips, textEntries),
                         ...audioParts,
                     ],
                 },

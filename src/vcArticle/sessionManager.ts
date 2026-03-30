@@ -10,11 +10,17 @@ import { getGuildSettings } from '../database';
 import { OpusDecoder } from '../opusDecoder';
 import { UserAudioRecorder } from '../recorder';
 import { extractArticleTopics, generateArticleFromTopic } from './ai';
+import { loadArchivedSession, saveArchivedSession, StoredAudioClip, updateArchivedSessionSummaryLabel } from './storage';
 import { ArticleTopic, TextChatEntry, TopicExtractionResult } from './types';
 
+const ARTICLE_CHUNK_INTERVAL_MS = 15 * 60 * 1000;
+
 interface FinalizedArticleSession {
-    audioFilesMap: Map<string, string>;
-    userMap: Map<string, string>;
+    archiveId: string | null;
+    createdAt: string | null;
+    voiceChannelName: string;
+    summaryLabel: string | null;
+    audioClips: StoredAudioClip[];
     textEntries: TextChatEntry[];
     topicResult: TopicExtractionResult | null;
 }
@@ -31,8 +37,13 @@ export class VcArticleSession {
     private textEntries: TextChatEntry[] = [];
     private userMap: Map<string, string> = new Map();
     private apiKey: string | null = null;
+    private voiceChannelName = 'Voice Channel';
     private finalized: FinalizedArticleSession | null = null;
     private sessionStartedAt: Date | null = null;
+    private pendingAudioClips: StoredAudioClip[] = [];
+    private chunkTimer: ReturnType<typeof setInterval> | null = null;
+    private chunkSequence = 0;
+    private chunkProcessing: Promise<void> = Promise.resolve();
 
     constructor(guildId: string, _bot: Client) {
         this.guildId = guildId;
@@ -50,6 +61,14 @@ export class VcArticleSession {
         return this.finalized?.topicResult || null;
     }
 
+    getActiveArchiveId(): string | null {
+        return this.finalized?.archiveId || null;
+    }
+
+    getActiveArchiveLabel(): string | null {
+        return this.finalized?.summaryLabel || null;
+    }
+
     getTopicById(id: number): ArticleTopic | null {
         const topics = this.finalized?.topicResult?.topics || [];
         return topics.find((topic) => topic.id === id) || null;
@@ -59,7 +78,8 @@ export class VcArticleSession {
         connection: VoiceConnection,
         channel: TextChannel,
         guild: Guild,
-        apiKey: string | null
+        apiKey: string | null,
+        voiceChannelName: string
     ): Promise<void> {
         await this.clearFinalizedArtifacts();
 
@@ -68,18 +88,21 @@ export class VcArticleSession {
         this.recorder = new UserAudioRecorder();
         this.isRecording = true;
         this.apiKey = apiKey;
+        this.voiceChannelName = voiceChannelName;
         this.textEntries = [];
         this.userMap = new Map();
         this.sessionStartedAt = new Date();
-
-        const voiceChannel = guild.channels.cache.get(channel.id) ?? guild.channels.cache.get(connection.joinConfig.channelId ?? '');
-        if (voiceChannel?.isVoiceBased()) {
-            voiceChannel.members.forEach((member) => {
-                if (!member.user.bot) {
-                    this.userMap.set(member.id, member.displayName);
-                }
-            });
-        }
+        this.pendingAudioClips = [];
+        this.chunkSequence = 0;
+        this.chunkProcessing = Promise.resolve();
+        guild.members.cache.forEach((member) => {
+            if (member.voice.channelId === connection.joinConfig.channelId && !member.user.bot) {
+                this.userMap.set(member.id, member.displayName);
+            }
+        });
+        this.chunkTimer = setInterval(() => {
+            void this.enqueueChunkProcessing();
+        }, ARTICLE_CHUNK_INTERVAL_MS);
 
         const receiver = connection.receiver;
 
@@ -153,34 +176,43 @@ export class VcArticleSession {
         }
 
         this.isRecording = false;
+        this.clearChunkTimer();
+        await this.enqueueChunkProcessing();
 
-        const rawFiles = await this.recorder.flushAudio();
-        const audioFilesMap = new Map<string, string>();
-        const cleanupTargets: string[] = [];
-
-        for (const [userId, pcmPath] of rawFiles.entries()) {
-            cleanupTargets.push(pcmPath);
-            const mp3Path = convertToMp3(pcmPath);
-            if (mp3Path) {
-                audioFilesMap.set(userId, mp3Path);
-            }
+        if (this.pendingAudioClips.length === 0) {
+            this.disposeVoiceConnection();
+            this.resetLiveResources();
+            return { sessionSummary: '録音データがありませんでした。', topics: [] };
         }
 
-        cleanupFiles(cleanupTargets);
+        const archived = saveArchivedSession({
+            guildId: this.guildId,
+            voiceChannelName: this.voiceChannelName,
+            audioClips: this.pendingAudioClips,
+            textEntries: this.textEntries,
+            createdAt: this.sessionStartedAt || new Date(),
+        });
+        this.pendingAudioClips = [];
 
         const settings = getGuildSettings(this.guildId);
         const topicResult = await extractArticleTopics(
-            audioFilesMap,
-            this.userMap,
-            this.textEntries,
+            archived.audioClips,
+            archived.textEntries,
             this.apiKey,
             settings.model_name
         );
+        const summaryLabel = updateArchivedSessionSummaryLabel(
+            archived.archiveId,
+            topicResult.sessionSummary || this.voiceChannelName
+        );
 
         this.finalized = {
-            audioFilesMap,
-            userMap: new Map(this.userMap),
-            textEntries: [...this.textEntries],
+            archiveId: archived.archiveId,
+            createdAt: archived.createdAt,
+            voiceChannelName: archived.voiceChannelName,
+            summaryLabel,
+            audioClips: archived.audioClips,
+            textEntries: archived.textEntries,
             topicResult,
         };
 
@@ -202,8 +234,7 @@ export class VcArticleSession {
 
         const settings = getGuildSettings(this.guildId);
         return generateArticleFromTopic(
-            this.finalized.audioFilesMap,
-            this.finalized.userMap,
+            this.finalized.audioClips,
             this.finalized.textEntries,
             topic,
             this.apiKey,
@@ -211,8 +242,40 @@ export class VcArticleSession {
         );
     }
 
+    async loadArchiveAndExtractTopics(archiveId: string, apiKey: string | null): Promise<TopicExtractionResult> {
+        await this.clearFinalizedArtifacts();
+        this.apiKey = apiKey;
+
+        const archived = loadArchivedSession(archiveId, this.guildId);
+        const settings = getGuildSettings(this.guildId);
+        const topicResult = await extractArticleTopics(
+            archived.audioClips,
+            archived.textEntries,
+            this.apiKey,
+            settings.model_name
+        );
+        const summaryLabel = updateArchivedSessionSummaryLabel(
+            archived.archiveId,
+            topicResult.sessionSummary || archived.voiceChannelName
+        );
+
+        this.finalized = {
+            archiveId: archived.archiveId,
+            createdAt: archived.createdAt,
+            voiceChannelName: archived.voiceChannelName,
+            summaryLabel,
+            audioClips: archived.audioClips,
+            textEntries: archived.textEntries,
+            topicResult,
+        };
+
+        return topicResult;
+    }
+
     async discard(): Promise<void> {
         this.isRecording = false;
+        this.clearChunkTimer();
+        await this.chunkProcessing.catch(() => undefined);
         this.disposeVoiceConnection();
         this.resetLiveResources();
         await this.clearFinalizedArtifacts();
@@ -221,6 +284,7 @@ export class VcArticleSession {
     handleDestroyedConnection(connection: VoiceConnection): boolean {
         if (this.voiceConnection !== connection) return false;
         this.isRecording = false;
+        this.clearChunkTimer();
         this.voiceConnection = null;
         this.resetLiveResources();
         return true;
@@ -234,17 +298,62 @@ export class VcArticleSession {
     }
 
     private resetLiveResources(): void {
+        cleanupFiles(this.pendingAudioClips.map((clip) => clip.filePath));
         this.recorder = null;
         this.opusDecoders.clear();
         this.subscribedUsers.clear();
         this.targetTextChannel = null;
         this.sessionStartedAt = null;
+        this.pendingAudioClips = [];
+        this.chunkSequence = 0;
     }
 
     private async clearFinalizedArtifacts(): Promise<void> {
-        if (!this.finalized) return;
-        cleanupFiles(Array.from(this.finalized.audioFilesMap.values()));
         this.finalized = null;
+    }
+
+    private clearChunkTimer(): void {
+        if (this.chunkTimer) {
+            clearInterval(this.chunkTimer);
+            this.chunkTimer = null;
+        }
+    }
+
+    private async enqueueChunkProcessing(): Promise<void> {
+        this.chunkProcessing = this.chunkProcessing
+            .then(async () => {
+                await this.flushCurrentChunk();
+            })
+            .catch((error) => {
+                console.error(`[${this.guildId}] VC article chunk processing error:`, error);
+            });
+
+        await this.chunkProcessing;
+    }
+
+    private async flushCurrentChunk(): Promise<void> {
+        if (!this.recorder) return;
+
+        const rawFiles = await this.recorder.flushAudio();
+        if (rawFiles.size === 0) return;
+
+        const cleanupTargets: string[] = [];
+
+        for (const [userId, pcmPath] of rawFiles.entries()) {
+            cleanupTargets.push(pcmPath);
+            const mp3Path = convertToMp3(pcmPath);
+            if (!mp3Path) continue;
+
+            this.chunkSequence += 1;
+            this.pendingAudioClips.push({
+                clipId: `${String(this.chunkSequence).padStart(4, '0')}_${Date.now()}`,
+                userId,
+                displayName: this.userMap.get(userId) || `User_${userId}`,
+                filePath: mp3Path,
+            });
+        }
+
+        cleanupFiles(cleanupTargets);
     }
 }
 
