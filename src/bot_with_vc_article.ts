@@ -409,6 +409,9 @@ async function handleAnalyzeStart(
             if (newState.status === VoiceConnectionStatus.Destroyed) {
                 sessionManager.cleanupDestroyedConnection(guildId, connection);
             }
+            if (newState.status === VoiceConnectionStatus.Ready) {
+                seedVoiceParticipants(connection, voiceChannel);
+            }
         });
         connection.on('error', (error) => {
             console.error('[Voice] Connection Error:', error);
@@ -418,7 +421,6 @@ async function handleAnalyzeStart(
         });
 
         await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
-        seedVoiceParticipants(connection, voiceChannel);
 
         const settings = getGuildSettings(guildId);
         const mode = settings.analysis_mode || 'debate';
@@ -563,10 +565,12 @@ async function handleArticleStart(
         if (newState.status === VoiceConnectionStatus.Destroyed) {
             vcArticleManager.cleanupDestroyedConnection(guildId, connection);
         }
+        if (newState.status === VoiceConnectionStatus.Ready) {
+            seedVoiceParticipants(connection, voiceChannel);
+        }
     });
 
     await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
-    seedVoiceParticipants(connection, voiceChannel);
     await articleSession.startRecording(
         connection,
         interaction.channel as TextChannel,

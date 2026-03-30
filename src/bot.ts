@@ -311,6 +311,10 @@ async function handleAnalyzeStart(
                 console.log('[Voice] Connection destroyed. Cleaning up stale session state.');
                 sessionManager.cleanupDestroyedConnection(guildId, connection);
             }
+
+            if (newState.status === VoiceConnectionStatus.Ready) {
+                seedVoiceParticipants(connection, voiceChannel);
+            }
         });
         connection.on('error', error => {
             console.error('[Voice] Connection Error:', error);
@@ -320,7 +324,6 @@ async function handleAnalyzeStart(
         });
 
         await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
-        seedVoiceParticipants(connection, voiceChannel);
 
         const settings = getGuildSettings(guildId);
         const mode = settings.analysis_mode || 'debate';
