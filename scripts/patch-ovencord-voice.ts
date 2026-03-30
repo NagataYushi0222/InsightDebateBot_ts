@@ -1,27 +1,78 @@
 import fs from 'fs';
 import path from 'path';
 
-const targets = [
-    path.resolve('node_modules/@ovencord/voice/src/receive/VoiceReceiver.ts'),
-    path.resolve('node_modules/@ovencord/voice/src/networking/Networking.ts'),
+type Transform =
+    | {
+          kind: 'literal';
+          from: string;
+          to: string;
+      }
+    | {
+          kind: 'regex';
+          from: RegExp;
+          to: string;
+      };
+
+const patches = [
+    {
+        target: path.resolve('node_modules/@ovencord/voice/src/receive/VoiceReceiver.ts'),
+        transforms: <Transform[]>[
+            {
+                kind: 'literal',
+                from: "@noble/ciphers/aes",
+                to: "@noble/ciphers/aes.js",
+            },
+            {
+                kind: 'regex',
+                from: /const cipher = gcm\(secretKey, nonce\);\s+return cipher\.decrypt\(encryptedWithAuthTag, header\);/g,
+                to: "const cipher = gcm(secretKey, nonce, header);\n\t\t\t\treturn cipher.decrypt(encryptedWithAuthTag);",
+            },
+        ],
+    },
+    {
+        target: path.resolve('node_modules/@ovencord/voice/src/networking/Networking.ts'),
+        transforms: <Transform[]>[
+            {
+                kind: 'literal',
+                from: "@noble/ciphers/aes",
+                to: "@noble/ciphers/aes.js",
+            },
+            {
+                kind: 'regex',
+                from: /const cipher = gcm\(secretKey, connectionData\.nonceBuffer\);\s+encrypted = cipher\.encrypt\(uintPacket, additionalData\);/g,
+                to: "const cipher = gcm(secretKey, connectionData.nonceBuffer, additionalData);\n\t\t\t\tencrypted = cipher.encrypt(uintPacket);",
+            },
+        ],
+    },
 ];
 
-const from = "@noble/ciphers/aes";
-const to = "@noble/ciphers/aes.js";
-
-for (const target of targets) {
-    if (!fs.existsSync(target)) {
+for (const patch of patches) {
+    if (!fs.existsSync(patch.target)) {
         continue;
     }
 
-    const current = fs.readFileSync(target, 'utf8');
-    if (!current.includes(from)) {
-        continue;
+    let current = fs.readFileSync(patch.target, 'utf8');
+    let changed = false;
+
+    for (const transform of patch.transforms) {
+        if (transform.kind === 'literal') {
+            if (!current.includes(transform.from)) {
+                continue;
+            }
+            current = current.replaceAll(transform.from, transform.to);
+            changed = true;
+            continue;
+        }
+
+        if (!transform.from.test(current)) {
+            continue;
+        }
+        current = current.replace(transform.from, transform.to);
+        changed = true;
     }
 
-    const next = current.replaceAll(from, to);
-    if (next !== current) {
-        fs.writeFileSync(target, next, 'utf8');
-        console.log(`patched: ${path.relative(process.cwd(), target)}`);
+    if (changed) {
+        fs.writeFileSync(patch.target, current, 'utf8');
+        console.log(`patched: ${path.relative(process.cwd(), patch.target)}`);
     }
 }

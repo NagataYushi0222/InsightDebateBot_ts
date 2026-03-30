@@ -8,9 +8,11 @@ import {
     TextChannel,
     Events,
     MessageFlags,
+    VoiceBasedChannel,
 } from 'discord.js';
 import {
     joinVoiceChannel,
+    VoiceConnection,
     VoiceConnectionStatus,
     entersState,
 } from '@ovencord/voice';
@@ -31,6 +33,22 @@ const client = new Client({
 });
 
 const sessionManager = new SessionManager(client);
+
+function seedVoiceParticipants(connection: VoiceConnection, voiceChannel: VoiceBasedChannel): void {
+    if (connection.state.status !== VoiceConnectionStatus.Ready) {
+        return;
+    }
+
+    const connectedClients = connection.state.networking.state.connectionData.connectedClients;
+    for (const [memberId, member] of voiceChannel.members) {
+        if (member.user.bot) {
+            continue;
+        }
+        connectedClients.add(memberId);
+    }
+
+    console.log(`[Voice Seed] Seeded ${connectedClients.size} connected client(s) for channel ${voiceChannel.id}`);
+}
 
 // === コマンド定義 ===
 const commands = [
@@ -302,6 +320,7 @@ async function handleAnalyzeStart(
         });
 
         await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+        seedVoiceParticipants(connection, voiceChannel);
 
         const settings = getGuildSettings(guildId);
         const mode = settings.analysis_mode || 'debate';
