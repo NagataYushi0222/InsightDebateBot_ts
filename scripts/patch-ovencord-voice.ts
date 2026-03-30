@@ -18,8 +18,8 @@ const patches = [
         target: path.resolve('node_modules/@ovencord/voice/src/receive/VoiceReceiver.ts'),
         transforms: <Transform[]>[
             {
-                kind: 'literal',
-                from: "@noble/ciphers/aes",
+                kind: 'regex',
+                from: /@noble\/ciphers\/aes(?!(?:\.js)+)/g,
                 to: "@noble/ciphers/aes.js",
             },
             {
@@ -33,8 +33,8 @@ const patches = [
         target: path.resolve('node_modules/@ovencord/voice/src/networking/Networking.ts'),
         transforms: <Transform[]>[
             {
-                kind: 'literal',
-                from: "@noble/ciphers/aes",
+                kind: 'regex',
+                from: /@noble\/ciphers\/aes(?!(?:\.js)+)/g,
                 to: "@noble/ciphers/aes.js",
             },
             {
