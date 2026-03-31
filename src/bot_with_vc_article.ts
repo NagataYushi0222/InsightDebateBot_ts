@@ -54,7 +54,16 @@ function seedVoiceParticipants(connection: VoiceConnection, voiceChannel: VoiceB
         return;
     }
 
-    const connectedClients = connection.state.networking.state.connectionData.connectedClients;
+    const networkingState = connection.state.networking.state as {
+        connectionData?: {
+            connectedClients?: Set<string>;
+        };
+    };
+    const connectedClients = networkingState.connectionData?.connectedClients;
+    if (!connectedClients) {
+        return;
+    }
+
     for (const [memberId, member] of voiceChannel.members) {
         if (member.user.bot) {
             continue;
