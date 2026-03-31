@@ -622,7 +622,7 @@ async function handleArticleTopics(
     const topicResult = vcArticleManager.getSession(guildId).getTopicResult();
     if (!topicResult) {
         await interaction.reply({
-            content: 'まだ記事候補はありません。先に `/article_stop` を実行してください。',
+            content: 'まだ記事候補はありません。先に `/article_stop` または `/article_load` を実行してください。',
             flags: MessageFlags.Ephemeral,
         });
         return;
@@ -673,7 +673,7 @@ async function handleArticleLoad(
     }
 
     await interaction.deferReply();
-    await interaction.followUp(`📂 保存済み音声 ${archiveId} を読み込み、記事候補を抽出しています...`);
+    await interaction.followUp(`📂 保存済み音声 ${archiveId} を読み込み、保存済み記事候補を確認しています...`);
     const topicResult = await articleSession.loadArchiveAndExtractTopics(archiveId, userKey);
     await followUpInChunks(interaction, formatTopicsMessage(topicResult, articleSession.getActiveArchiveId()));
 }
@@ -687,7 +687,7 @@ async function handleArticleWrite(
 
     if (!articleSession.hasTopicCache()) {
         await interaction.reply({
-            content: '記事化対象のトピックがありません。先に `/article_stop` を実行してください。',
+            content: '記事化対象のトピックがありません。先に `/article_stop` または `/article_load` を実行してください。',
             flags: MessageFlags.Ephemeral,
         });
         return;

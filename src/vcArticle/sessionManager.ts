@@ -10,7 +10,13 @@ import { getGuildSettings } from '../database';
 import { OpusDecoder } from '../opusDecoder';
 import { UserAudioRecorder } from '../recorder';
 import { extractArticleTopics, generateArticleFromTopic } from './ai';
-import { loadArchivedSession, saveArchivedSession, StoredAudioClip, updateArchivedSessionSummaryLabel } from './storage';
+import {
+    loadArchivedSession,
+    saveArchivedSession,
+    StoredAudioClip,
+    updateArchivedSessionSummaryLabel,
+    updateArchivedSessionTopicResult,
+} from './storage';
 import { ArticleTopic, TextChatEntry, TopicExtractionResult } from './types';
 
 const ARTICLE_CHUNK_INTERVAL_MS = 15 * 60 * 1000;
@@ -205,6 +211,7 @@ export class VcArticleSession {
             archived.archiveId,
             topicResult.sessionSummary || this.voiceChannelName
         );
+        updateArchivedSessionTopicResult(archived.archiveId, topicResult);
 
         this.finalized = {
             archiveId: archived.archiveId,
@@ -247,6 +254,20 @@ export class VcArticleSession {
         this.apiKey = apiKey;
 
         const archived = loadArchivedSession(archiveId, this.guildId);
+        if (archived.topicResult) {
+            this.finalized = {
+                archiveId: archived.archiveId,
+                createdAt: archived.createdAt,
+                voiceChannelName: archived.voiceChannelName,
+                summaryLabel: archived.summaryLabel,
+                audioClips: archived.audioClips,
+                textEntries: archived.textEntries,
+                topicResult: archived.topicResult,
+            };
+
+            return archived.topicResult;
+        }
+
         const settings = getGuildSettings(this.guildId);
         const topicResult = await extractArticleTopics(
             archived.audioClips,
@@ -258,6 +279,7 @@ export class VcArticleSession {
             archived.archiveId,
             topicResult.sessionSummary || archived.voiceChannelName
         );
+        updateArchivedSessionTopicResult(archived.archiveId, topicResult);
 
         this.finalized = {
             archiveId: archived.archiveId,

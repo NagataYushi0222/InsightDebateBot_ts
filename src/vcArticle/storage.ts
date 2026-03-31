@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { TEMP_AUDIO_DIR } from '../config';
-import { TextChatEntry } from './types';
+import { TextChatEntry, TopicExtractionResult } from './types';
 
 const ARTICLE_ARCHIVE_ROOT = path.resolve(TEMP_AUDIO_DIR, 'vc_article_archive');
 const ARCHIVE_RETENTION_DAYS = 7;
@@ -30,6 +30,7 @@ interface ArchivedSessionMetadata {
     createdAt: string;
     dateKey: string;
     summaryLabel?: string;
+    topicResult?: TopicExtractionResult;
     audioFiles: ArchivedAudioFile[];
     textEntries: TextChatEntry[];
 }
@@ -51,6 +52,7 @@ export interface LoadedArchivedSession {
     createdAt: string;
     voiceChannelName: string;
     summaryLabel: string | null;
+    topicResult: TopicExtractionResult | null;
     audioClips: StoredAudioClip[];
     textEntries: TextChatEntry[];
 }
@@ -233,6 +235,7 @@ export function saveArchivedSession(params: {
         createdAt: metadata.createdAt,
         voiceChannelName: metadata.voiceChannelName,
         summaryLabel: metadata.summaryLabel || null,
+        topicResult: metadata.topicResult || null,
         audioClips: persistedAudioClips,
         textEntries: params.textEntries,
     };
@@ -258,6 +261,29 @@ export function updateArchivedSessionSummaryLabel(archiveId: string, summary: st
     metadata.summaryLabel = summaryLabel;
     fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2), 'utf8');
     return summaryLabel;
+}
+
+export function updateArchivedSessionTopicResult(
+    archiveId: string,
+    topicResult: TopicExtractionResult,
+): void {
+    cleanupExpiredArchives();
+    const metadataPath = collectMetadataPaths().find((candidate) => {
+        try {
+            const metadata = readMetadata(candidate);
+            return metadata.archiveId === archiveId;
+        } catch {
+            return false;
+        }
+    });
+
+    if (!metadataPath) {
+        throw new Error(`保存済み音声 ${archiveId} が見つかりませんでした。`);
+    }
+
+    const metadata = readMetadata(metadataPath);
+    metadata.topicResult = topicResult;
+    fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2), 'utf8');
 }
 
 export function listArchivedSessions(limit: number = 20, guildId?: string): ArchivedSessionSummary[] {
@@ -325,6 +351,7 @@ export function loadArchivedSession(archiveId: string, guildId?: string): Loaded
         createdAt: metadata.createdAt,
         voiceChannelName: metadata.voiceChannelName,
         summaryLabel: metadata.summaryLabel || null,
+        topicResult: metadata.topicResult || null,
         audioClips,
         textEntries: metadata.textEntries || [],
     };
