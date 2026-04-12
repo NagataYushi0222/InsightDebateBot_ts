@@ -285,9 +285,12 @@ client.on('interactionCreate', async (interaction) => {
 
 client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
     if (oldState.member?.id === client.user?.id) return;
-    if (!oldState.channelId || oldState.channelId === newState.channelId) return;
 
     const guildId = oldState.guild.id;
+    sharedVoiceCoordinator.syncActiveConnectionParticipants(guildId);
+
+    if (!oldState.channelId || oldState.channelId === newState.channelId) return;
+
     const analyzeSession = sessionManager.getSession(guildId);
     const articleSession = vcArticleManager.getSession(guildId);
     const { analyzeActive, articleActive, sharedConnection } =

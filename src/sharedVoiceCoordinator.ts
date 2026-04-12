@@ -14,8 +14,20 @@ interface ChannelActivityState {
     sharedConnection: boolean;
 }
 
+interface MutableNetworkingState {
+    code?: number;
+    connectionData?: {
+        connectedClients?: Set<string>;
+    };
+    dave?: {
+        reinit?: () => void;
+        reinitializing?: boolean;
+    };
+}
+
 export class SharedVoiceCoordinator {
     private readonly managedVoiceConnections = new WeakSet<VoiceConnection>();
+    private readonly lastDaveReinitAt = new WeakMap<VoiceConnection, number>();
 
     constructor(
         private readonly client: Client,
@@ -51,6 +63,15 @@ export class SharedVoiceCoordinator {
         return this.buildActivityState(guildId, channelId);
     }
 
+    syncActiveConnectionParticipants(guildId: string): void {
+        const connection = this.getActiveGuildVoiceConnection(guildId);
+        if (!connection) {
+            return;
+        }
+
+        this.syncParticipantsForConnection(guildId, connection);
+    }
+
     async ensureVoiceConnectionForChannel(
         guildId: string,
         voiceChannel: VoiceBasedChannel,
@@ -66,7 +87,7 @@ export class SharedVoiceCoordinator {
 
             this.registerManagedVoiceConnection(guildId, existingConnection);
             await entersState(existingConnection, VoiceConnectionStatus.Ready, 30_000);
-            this.seedVoiceParticipantsForConnection(guildId, existingConnection);
+            this.syncParticipantsForConnection(guildId, existingConnection);
             return { connection: existingConnection, reused: true };
         }
 
@@ -119,7 +140,7 @@ export class SharedVoiceCoordinator {
 
     private registerManagedVoiceConnection(guildId: string, connection: VoiceConnection): void {
         if (this.managedVoiceConnections.has(connection)) {
-            this.seedVoiceParticipantsForConnection(guildId, connection);
+            this.syncParticipantsForConnection(guildId, connection);
             return;
         }
 
@@ -136,7 +157,7 @@ export class SharedVoiceCoordinator {
                 this.vcArticleManager.cleanupDestroyedConnection(guildId, connection);
             }
             if (newState.status === VoiceConnectionStatus.Ready) {
-                this.seedVoiceParticipantsForConnection(guildId, connection);
+                this.syncParticipantsForConnection(guildId, connection);
             }
         });
         connection.on('error', (error) => {
@@ -146,10 +167,10 @@ export class SharedVoiceCoordinator {
             console.log(`[Shared Voice Debug] ${message}`);
         });
 
-        this.seedVoiceParticipantsForConnection(guildId, connection);
+        this.syncParticipantsForConnection(guildId, connection);
     }
 
-    private seedVoiceParticipantsForConnection(guildId: string, connection: VoiceConnection): void {
+    private syncParticipantsForConnection(guildId: string, connection: VoiceConnection): void {
         const guild = this.client.guilds.cache.get(guildId);
         if (!guild) {
             return;
@@ -160,33 +181,65 @@ export class SharedVoiceCoordinator {
             return;
         }
 
-        this.seedVoiceParticipants(connection, channel);
+        const changed = this.seedVoiceParticipants(connection, channel);
+        if (changed) {
+            this.reinitializeDaveSession(connection, channel.id);
+        }
     }
 
-    private seedVoiceParticipants(connection: VoiceConnection, voiceChannel: VoiceBasedChannel): void {
+    private seedVoiceParticipants(connection: VoiceConnection, voiceChannel: VoiceBasedChannel): boolean {
         if (connection.state.status !== VoiceConnectionStatus.Ready) {
-            return;
+            return false;
         }
 
-        const networkingState = connection.state.networking.state as {
-            connectionData?: {
-                connectedClients?: Set<string>;
-            };
-        };
+        const networkingState = connection.state.networking.state as MutableNetworkingState;
         const connectedClients = networkingState.connectionData?.connectedClients;
         if (!connectedClients) {
-            return;
+            return false;
         }
 
+        const nextMembers = new Set<string>();
         for (const [memberId, member] of voiceChannel.members) {
             if (member.user.bot) {
                 continue;
             }
+            nextMembers.add(memberId);
+        }
+
+        const previousSignature = Array.from(connectedClients).sort().join(',');
+        const nextSignature = Array.from(nextMembers).sort().join(',');
+
+        connectedClients.clear();
+        for (const memberId of nextMembers) {
             connectedClients.add(memberId);
         }
 
         console.log(
             `[Voice Seed] Seeded ${connectedClients.size} connected client(s) for channel ${voiceChannel.id}`
         );
+
+        return previousSignature !== nextSignature;
+    }
+
+    private reinitializeDaveSession(connection: VoiceConnection, channelId: string): void {
+        if (connection.state.status !== VoiceConnectionStatus.Ready) {
+            return;
+        }
+
+        const networkingState = connection.state.networking.state as MutableNetworkingState;
+        const daveSession = networkingState.dave;
+        if (!daveSession?.reinit || daveSession.reinitializing) {
+            return;
+        }
+
+        const lastReinitAt = this.lastDaveReinitAt.get(connection) ?? 0;
+        const now = Date.now();
+        if (now - lastReinitAt < 3_000) {
+            return;
+        }
+
+        this.lastDaveReinitAt.set(connection, now);
+        console.log(`[Voice Seed] Reinitializing DAVE session after participant sync for channel ${channelId}`);
+        daveSession.reinit();
     }
 }
