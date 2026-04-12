@@ -170,7 +170,6 @@ async function generateContentWithSearchTool(
             toolConfig: {
                 functionCallingConfig: {
                     mode: FunctionCallingConfigMode.AUTO,
-                    allowedFunctionNames: ['search_web'],
                 },
             },
             tools: [{ functionDeclarations: [functionDeclaration] }],
