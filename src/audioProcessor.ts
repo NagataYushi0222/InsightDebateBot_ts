@@ -15,7 +15,7 @@ export function convertToMp3(filePath: string): string | null {
     try {
         const mp3Path = filePath.replace(/\.\w+$/, '.mp3');
 
-        // ffmpeg-staticからfmpeg パスを取得
+        // まず同梱 ffmpeg を使い、なければサーバーに入っている ffmpeg を使う。
         let ffmpegPath: string;
         try {
             ffmpegPath = require('ffmpeg-static') as string;
@@ -24,13 +24,13 @@ export function convertToMp3(filePath: string): string | null {
         }
 
         if (filePath.endsWith('.pcm')) {
-            // Discord PCM: signed 16-bit little-endian, 48000Hz, 2 channels
+            // 生 PCM はヘッダがないので、サンプル形式を ffmpeg に明示する必要がある。
             execSync(
                 `"${ffmpegPath}" -f s16le -ar 48000 -ac 2 -i "${filePath}" -y "${mp3Path}"`,
                 { stdio: 'pipe' }
             );
         } else {
-            // WAV or other format
+            // WAV などヘッダ付きの形式なら ffmpeg に自動判定させる。
             execSync(
                 `"${ffmpegPath}" -i "${filePath}" -y "${mp3Path}"`,
                 { stdio: 'pipe' }

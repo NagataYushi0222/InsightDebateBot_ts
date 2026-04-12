@@ -44,6 +44,7 @@ export class SharedVoiceCoordinator {
 
     getActiveGuildVoiceConnection(guildId: string): VoiceConnection | null {
         const analyzeSession = this.sessionManager.getExistingSession(guildId);
+        // 「接続オブジェクトが残っている」ではなく、「実際に録音中」を active とみなす。
         if (analyzeSession?.isRecording && analyzeSession.hasActiveConnection()) {
             return analyzeSession.voiceConnection;
         }
@@ -139,6 +140,7 @@ export class SharedVoiceCoordinator {
         return {
             analyzeActive,
             articleActive,
+            // 同じ VoiceConnection を両モードが本当に共有している場合だけ shared 扱いにする。
             sharedConnection: analyzeActive
                 && articleActive
                 && analyzeSession?.voiceConnection === articleSession?.voiceConnection,

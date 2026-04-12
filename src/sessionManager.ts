@@ -32,9 +32,12 @@ export class GuildSession {
     private currentTaskLabel: string = '待機中';
     private lastStatusContent: string = '';
     private isProcessingAudio: boolean = false;
+    // stop 中に start/now が割り込まないように、終了処理中を明示的に持つ。
     private isStopping: boolean = false;
+    // stop 時に「定期ループが本当に止まったか」を待つための Promise。
     private processLoopPromise: Promise<void> | null = null;
     private processLoopWaitResolver: (() => void) | null = null;
+    // 最終分析と定期分析が二重起動しないよう、分析処理を 1 本に制限する。
     private processingPromise: Promise<void> | null = null;
     private readonly consumerLabel: string;
     private lastVoiceStats: VoiceConsumerDiagnosticsSnapshot | null = null;
@@ -154,6 +157,7 @@ export class GuildSession {
         this.isRecording = false;
 
         if (activeConnection) {
+            // 先にセッション参照を外しておくと、共有接続の active 判定に残骸が残りにくい。
             this.voiceConnection = null;
             if (destroyConnection && activeConnection.state.status !== VoiceConnectionStatus.Destroyed) {
                 activeConnection.destroy();
@@ -161,6 +165,7 @@ export class GuildSession {
         }
 
         try {
+            // 既存の periodic/manual 分析が残っていたら、ここで終わるのを待つ。
             await this.waitForBackgroundActivity();
 
             if (shouldRunFinal && this.recorder) {
@@ -572,6 +577,7 @@ export class GuildSession {
 
     private async waitForProcessLoopTick(): Promise<void> {
         await new Promise<void>((resolve) => {
+            // stop 時はこの待機を即解除して、次の periodic cycle に入らせない。
             const timeout = setTimeout(() => {
                 if (this.processLoopWaitResolver === wake) {
                     this.processLoopWaitResolver = null;

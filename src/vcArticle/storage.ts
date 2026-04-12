@@ -117,6 +117,7 @@ function buildSummaryLabel(summary: string, maxLength: number = 20): string {
 function collectMetadataPaths(): string[] {
     if (!fs.existsSync(ARTICLE_ARCHIVE_ROOT)) return [];
 
+    // アーカイブ本体ではなく metadata.json を起点に一覧化する。
     const metadataPaths: string[] = [];
     for (const dateDir of fs.readdirSync(ARTICLE_ARCHIVE_ROOT, { withFileTypes: true })) {
         if (!dateDir.isDirectory()) continue;
@@ -147,6 +148,7 @@ export function cleanupExpiredArchives(): number {
     let removedCount = 0;
     const nowMs = Date.now();
 
+    // 期限切れはセッション単位で削除し、空になった日付ディレクトリも掃除する。
     for (const metadataPath of collectMetadataPaths()) {
         try {
             const metadata = readMetadata(metadataPath);
@@ -194,6 +196,7 @@ export function saveArchivedSession(params: {
         const { clipId, userId, displayName, filePath: sourcePath } = clip;
         if (!fs.existsSync(sourcePath)) continue;
 
+        // 一時保存された MP3 を、日付別アーカイブ配下へ移動して永続管理に切り替える。
         const safeName = sanitizeFileSegment(displayName);
         const destinationName = `${safeName}_${userId}_${clipId}.mp3`;
         const destinationPath = path.join(sessionDir, destinationName);
@@ -258,6 +261,7 @@ export function updateArchivedSessionSummaryLabel(archiveId: string, summary: st
 
     const metadata = readMetadata(metadataPath);
     const summaryLabel = buildSummaryLabel(summary);
+    // 一覧表示用に、概要の先頭だけを短いタイトルとして保持する。
     metadata.summaryLabel = summaryLabel;
     fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2), 'utf8');
     return summaryLabel;
@@ -333,6 +337,8 @@ export function loadArchivedSession(archiveId: string, guildId?: string): Loaded
         throw new Error(`保存済み音声 ${archiveId} はこのサーバーでは利用できません。`);
     }
     const sessionDir = path.dirname(metadataPath);
+
+    // metadata に保存してある相対パスから、実際の音声ファイルパスを復元する。
     const audioClips: StoredAudioClip[] = [];
 
     for (const file of metadata.audioFiles) {

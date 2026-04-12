@@ -6,12 +6,14 @@ import { ARTICLE_GENERATION_PROMPT, TOPIC_EXTRACTION_PROMPT } from './prompts';
 import { StoredAudioClip } from './storage';
 import { ArticleTopic, TextChatEntry, TopicExtractionResult } from './types';
 
+// Gemini が ```json``` 付きで返しても JSON として読めるようにする。
 function stripCodeFence(text: string): string {
     const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
     if (fenced?.[1]) return fenced[1].trim();
     return text.trim();
 }
 
+// モデル出力を Bot 内部の型に寄せて、欠損値や余分な件数をならす。
 function toJsonResult(rawText: string): TopicExtractionResult {
     const parsed = JSON.parse(stripCodeFence(rawText)) as Partial<TopicExtractionResult>;
     const topics = Array.isArray(parsed.topics) ? parsed.topics : [];
@@ -82,12 +84,14 @@ function buildSharedParts(
     const parts: any[] = [];
     const participantMap = buildParticipantMap(audioClips);
 
+    // 音声断片だけでは誰の声か崩れやすいので、最初に参加者一覧を固定情報として渡す。
     parts.push({
         text: `参加者一覧:\n${Array.from(participantMap.entries()).map(([userId, name], index) => {
             return `${index + 1}. ${name} [ID:${userId}]`;
         }).join('\n')}`,
     });
 
+    // 同じテキストチャンネルの発言も、記事化の補助情報として AI に渡す。
     if (textEntries.length > 0) {
         parts.push({
             text: [
@@ -116,6 +120,7 @@ async function uploadAudioParts(
         const uploadedFile = await uploadToGemini(ai, filePath);
         uploadedFiles.push(uploadedFile);
 
+        // 各音声ファイルの直前に話者ラベルを置いて、誰の発言かを対応づける。
         audioParts.push({ text: `発言者ラベル: ${displayName} [ID:${userId}] / 断片ID: ${clipId}` });
         audioParts.push({
             fileData: {
@@ -157,6 +162,7 @@ export async function extractArticleTopics(
     try {
         await waitForFilesActive(ai, uploadedFiles);
 
+        // トピック抽出では、音声・テキスト・検索結果を 1 回の生成にまとめて渡す。
         const { response } = await generateContentWithWebSearch(
             ai,
             useModel,
@@ -200,6 +206,7 @@ export async function generateArticleFromTopic(
     try {
         await waitForFilesActive(ai, uploadedFiles);
 
+        // 記事生成では、選ばれたトピック情報を追加して本文だけを返させる。
         const { response } = await generateContentWithWebSearch(
             ai,
             useModel,

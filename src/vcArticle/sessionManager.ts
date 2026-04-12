@@ -164,6 +164,7 @@ export class VcArticleSession {
         this.clearChunkTimer();
         await this.enqueueChunkProcessing();
 
+        // 録音停止後はすぐ VC から離れ、以後の保存と AI 処理は録音外で進める。
         this.releaseVoiceConnection(destroyConnection);
 
         const pendingAudioClips = [...this.pendingAudioClips];
@@ -184,6 +185,7 @@ export class VcArticleSession {
                 return { sessionSummary: '録音データがありませんでした。', topics: [] };
             }
 
+            // stop 時点の断片をいったんアーカイブへ固め、以後は保存済みファイルを読む。
             const archived = saveArchivedSession({
                 guildId: this.guildId,
                 voiceChannelName,
