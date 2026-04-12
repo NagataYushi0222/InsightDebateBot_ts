@@ -141,7 +141,9 @@ async function validateSearchResultUrl(rawUrl: string): Promise<string | null> {
 }
 
 async function fetchDuckDuckGoHtml(query: string): Promise<string> {
-    const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+    // html.duckduckgo.com はサーバー環境によって bot challenge を返しやすいため、
+    // ここでは実際に結果HTMLが取れた lite エンドポイントを優先して使う。
+    const url = `https://duckduckgo.com/lite/?q=${encodeURIComponent(query)}`;
     const response = await fetchWithTimeout(url, {
         headers: SEARCH_REQUEST_HEADERS,
     }, URL_VALIDATION_TIMEOUT_MS);
@@ -155,7 +157,7 @@ async function fetchDuckDuckGoHtml(query: string): Promise<string> {
 
 function parseDuckDuckGoResults(html: string): WebSearchResult[] {
     const rawResults: WebSearchResult[] = [];
-    const anchorRegex = /<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+    const anchorRegex = /<a[^>]*class=['"][^'"]*(?:result__a|result-link)[^'"]*['"][^>]*href=['"]([^'"]+)['"][^>]*>([\s\S]*?)<\/a>/gi;
 
     let match: RegExpExecArray | null;
     while ((match = anchorRegex.exec(html)) && rawResults.length < SEARCH_RESULT_SCAN_LIMIT) {
@@ -168,8 +170,9 @@ function parseDuckDuckGoResults(html: string): WebSearchResult[] {
         }
 
         const trailingHtml = html.slice(anchorRegex.lastIndex, anchorRegex.lastIndex + 1500);
-        const snippetMatch = trailingHtml.match(/<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/i)
-            || trailingHtml.match(/<div[^>]*class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
+        const snippetMatch = trailingHtml.match(/<a[^>]*class=['"][^'"]*(?:result__snippet|result-snippet)[^'"]*['"][^>]*>([\s\S]*?)<\/a>/i)
+            || trailingHtml.match(/<div[^>]*class=['"][^'"]*(?:result__snippet|result-snippet)[^'"]*['"][^>]*>([\s\S]*?)<\/div>/i)
+            || trailingHtml.match(/<td[^>]*class=['"][^'"]*result-snippet[^'"]*['"][^>]*>([\s\S]*?)<\/td>/i);
         const snippet = snippetMatch ? stripHtml(snippetMatch[1]) : '';
 
         rawResults.push({
