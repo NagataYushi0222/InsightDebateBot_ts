@@ -32,6 +32,10 @@ export class GuildSession {
     private currentTaskLabel: string = '待機中';
     private lastStatusContent: string = '';
     private isProcessingAudio: boolean = false;
+    private isStopping: boolean = false;
+    private processLoopPromise: Promise<void> | null = null;
+    private processLoopWaitResolver: (() => void) | null = null;
+    private processingPromise: Promise<void> | null = null;
     private readonly consumerLabel: string;
     private lastVoiceStats: VoiceConsumerDiagnosticsSnapshot | null = null;
 
@@ -78,11 +82,31 @@ export class GuildSession {
 
         // 定期分析ループを開始
         this.isProcessLoopRunning = true;
-        this.processLoop();
+        this.isStopping = false;
+        let loopPromise: Promise<void>;
+        loopPromise = this.processLoop()
+            .catch((error) => {
+                console.error(`[${this.guildId}] Error in process loop:`, error);
+            })
+            .finally(() => {
+                if (this.processLoopPromise === loopPromise) {
+                    this.processLoopPromise = null;
+                }
+                this.processLoopWaitResolver = null;
+            });
+        this.processLoopPromise = loopPromise;
     }
 
     hasActiveConnection(): boolean {
         return !!this.voiceConnection && this.voiceConnection.state.status !== VoiceConnectionStatus.Destroyed;
+    }
+
+    isBusy(): boolean {
+        return this.isRecording || this.isStopping || !!this.processingPromise;
+    }
+
+    isStoppingInProgress(): boolean {
+        return this.isStopping;
     }
 
     handleDestroyedConnection(connection: VoiceConnection): boolean {
@@ -90,11 +114,14 @@ export class GuildSession {
 
         this.isProcessLoopRunning = false;
         this.isRecording = false;
+        this.isStopping = false;
         this.isProcessingAudio = false;
+        this.resolveProcessLoopWait();
         this.detachFromVoiceCapture();
         this.logVoiceStats('connection_destroyed');
         this.voiceConnection = null;
         this.recorder = null;
+        this.processingPromise = null;
         this.statusMessage = null;
         this.currentStatus = '切断済み';
         this.currentTaskLabel = '接続が破棄されました';
@@ -108,38 +135,50 @@ export class GuildSession {
      * 録音を停止する
      */
     async stopRecording(skipFinal: boolean = false, destroyConnection: boolean = true): Promise<void> {
+        if (this.isStopping) {
+            await this.processingPromise?.catch(() => undefined);
+            return;
+        }
+
+        this.isStopping = true;
         this.isProcessLoopRunning = false;
+        this.resolveProcessLoopWait();
         this.currentStatus = skipFinal ? '停止処理中' : '最終分析中';
         this.currentTaskLabel = skipFinal ? '録音を停止しています' : '終了前の最終分析を準備しています';
         await this.refreshStatusMessage();
 
         const activeConnection = this.voiceConnection;
-        const shouldRunFinal = !skipFinal && !!activeConnection && !!this.recorder;
+        const shouldRunFinal = !skipFinal && !!this.recorder;
         this.detachFromVoiceCapture();
         this.logVoiceStats(skipFinal ? 'stop_without_final' : 'stop_with_final');
         this.isRecording = false;
 
-        if (shouldRunFinal) {
-            if (this.targetTextChannel) {
-                await this.targetTextChannel.send("🔄 終了前の最終分析を行っています...しばらくお待ちください。");
-            }
-            await this.processAudio(false, true);
-        }
-
-        this.isProcessingAudio = false;
-        this.cycleStartedAt = null;
-        this.currentStatus = '停止中';
-        this.currentTaskLabel = '録音は停止しています';
-
         if (activeConnection) {
+            this.voiceConnection = null;
             if (destroyConnection && activeConnection.state.status !== VoiceConnectionStatus.Destroyed) {
                 activeConnection.destroy();
             }
-            this.voiceConnection = null;
         }
 
-        this.recorder = null;
-        await this.clearStatusMessage();
+        try {
+            await this.waitForBackgroundActivity();
+
+            if (shouldRunFinal && this.recorder) {
+                if (this.targetTextChannel) {
+                    await this.targetTextChannel.send("🔄 終了前の最終分析を行っています...しばらくお待ちください。");
+                }
+                await this.processAudio(false, true);
+            }
+
+            this.isProcessingAudio = false;
+            this.cycleStartedAt = null;
+            this.currentStatus = '停止中';
+            this.currentTaskLabel = '録音は停止しています';
+            this.recorder = null;
+            await this.clearStatusMessage();
+        } finally {
+            this.isStopping = false;
+        }
     }
 
     getRemainingSeconds(): number | null {
@@ -263,7 +302,7 @@ export class GuildSession {
                         break;
                     }
 
-                    await new Promise(resolve => setTimeout(resolve, 5000));
+                    await this.waitForProcessLoopTick();
                 } catch (e) {
                     break;
                 }
@@ -280,8 +319,23 @@ export class GuildSession {
      */
     public async processAudio(isManual: boolean = false, isFinal: boolean = false): Promise<void> {
         if (!this.recorder || (!this.isRecording && !isFinal)) return;
-        if (this.isProcessingAudio) return;
+        if (this.processingPromise) {
+            await this.processingPromise.catch(() => undefined);
+            return;
+        }
 
+        let runPromise: Promise<void>;
+        runPromise = this.runProcessAudio(isManual, isFinal)
+            .finally(() => {
+                if (this.processingPromise === runPromise) {
+                    this.processingPromise = null;
+                }
+            });
+        this.processingPromise = runPromise;
+        await runPromise;
+    }
+
+    private async runProcessAudio(isManual: boolean = false, isFinal: boolean = false): Promise<void> {
         this.isProcessingAudio = true;
 
         const jobName = isManual ? 'Manual analysis' : 'Periodic analysis';
@@ -295,9 +349,15 @@ export class GuildSession {
             const userFilesRaw = await this.recorder.flushAudio();
 
             if (userFilesRaw.size === 0) {
-                this.currentStatus = '録音中';
-                this.currentTaskLabel = isManual ? '新しい音声がなかったため待機中' : '次回の自動分析を待機中';
-                await this.refreshStatusMessage(undefined, true);
+                if (isFinal || !this.isRecording) {
+                    this.currentStatus = '停止中';
+                    this.currentTaskLabel = '録音は停止しています';
+                    await this.clearStatusMessage();
+                } else {
+                    this.currentStatus = '録音中';
+                    this.currentTaskLabel = isManual ? '新しい音声がなかったため待機中' : '次回の自動分析を待機中';
+                    await this.refreshStatusMessage(undefined, true);
+                }
                 return;
             }
 
@@ -471,6 +531,10 @@ export class GuildSession {
             }
         } catch (e) {
             console.error(`[${this.guildId}] Error in processAudio:`, e);
+            if (this.targetTextChannel) {
+                const errorMessage = e instanceof Error ? e.message : String(e);
+                await this.targetTextChannel.send(`⚠️ 分析処理中にエラーが発生しました: ${errorMessage}`);
+            }
         } finally {
             this.isProcessingAudio = false;
 
@@ -495,6 +559,42 @@ export class GuildSession {
                 await this.refreshStatusMessage(undefined, true);
             }
         }
+    }
+
+    private async waitForBackgroundActivity(): Promise<void> {
+        if (this.processLoopPromise) {
+            await this.processLoopPromise.catch(() => undefined);
+        }
+        if (this.processingPromise) {
+            await this.processingPromise.catch(() => undefined);
+        }
+    }
+
+    private async waitForProcessLoopTick(): Promise<void> {
+        await new Promise<void>((resolve) => {
+            const timeout = setTimeout(() => {
+                if (this.processLoopWaitResolver === wake) {
+                    this.processLoopWaitResolver = null;
+                }
+                resolve();
+            }, 5000);
+
+            const wake = () => {
+                clearTimeout(timeout);
+                if (this.processLoopWaitResolver === wake) {
+                    this.processLoopWaitResolver = null;
+                }
+                resolve();
+            };
+
+            this.processLoopWaitResolver = wake;
+        });
+    }
+
+    private resolveProcessLoopWait(): void {
+        const resolver = this.processLoopWaitResolver;
+        this.processLoopWaitResolver = null;
+        resolver?.();
     }
 
     private detachFromVoiceCapture(): void {

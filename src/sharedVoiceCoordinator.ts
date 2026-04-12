@@ -43,13 +43,13 @@ export class SharedVoiceCoordinator {
     ) {}
 
     getActiveGuildVoiceConnection(guildId: string): VoiceConnection | null {
-        const analyzeSession = this.sessionManager.getSession(guildId);
-        if (analyzeSession.hasActiveConnection()) {
+        const analyzeSession = this.sessionManager.getExistingSession(guildId);
+        if (analyzeSession?.isRecording && analyzeSession.hasActiveConnection()) {
             return analyzeSession.voiceConnection;
         }
 
-        const articleSession = this.vcArticleManager.getSession(guildId);
-        if (articleSession.hasActiveConnection()) {
+        const articleSession = this.vcArticleManager.getExistingSession(guildId);
+        if (articleSession?.isRecording && articleSession.hasActiveConnection()) {
             return articleSession.voiceConnection;
         }
 
@@ -127,12 +127,12 @@ export class SharedVoiceCoordinator {
     }
 
     private buildActivityState(guildId: string, channelId: string): ChannelActivityState {
-        const analyzeSession = this.sessionManager.getSession(guildId);
-        const articleSession = this.vcArticleManager.getSession(guildId);
-        const analyzeActive = analyzeSession.hasActiveConnection()
+        const analyzeSession = this.sessionManager.getExistingSession(guildId);
+        const articleSession = this.vcArticleManager.getExistingSession(guildId);
+        const analyzeActive = !!analyzeSession?.hasActiveConnection()
             && analyzeSession.isRecording
             && analyzeSession.voiceConnection?.joinConfig.channelId === channelId;
-        const articleActive = articleSession.hasActiveConnection()
+        const articleActive = !!articleSession?.hasActiveConnection()
             && articleSession.isRecording
             && articleSession.voiceConnection?.joinConfig.channelId === channelId;
 
@@ -141,7 +141,7 @@ export class SharedVoiceCoordinator {
             articleActive,
             sharedConnection: analyzeActive
                 && articleActive
-                && analyzeSession.voiceConnection === articleSession.voiceConnection,
+                && analyzeSession?.voiceConnection === articleSession?.voiceConnection,
         };
     }
 

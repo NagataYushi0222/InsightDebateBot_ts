@@ -377,8 +377,10 @@ async function handleAnalyzeStart(
     await interaction.deferReply();
 
     const session = sessionManager.getSession(guildId);
-    if (session.hasActiveConnection()) {
-        await interaction.followUp('既に分析を実行中です。');
+    if (session.isBusy()) {
+        await interaction.followUp(session.isStoppingInProgress()
+            ? '要約モードは終了処理中です。完了してからもう一度実行してください。'
+            : '既に分析を実行中です。');
         return;
     }
 
@@ -410,7 +412,7 @@ async function handleAnalyzeStart(
             voiceChannel.name
         );
     } catch (error) {
-        if (session.hasActiveConnection()) {
+        if (session.hasActiveConnection() || session.isBusy()) {
             await session.stopRecording(true, sharedVoiceCoordinator.shouldDestroyAnalyzeConnection(guildId));
         }
         await interaction.followUp(`エラーが発生しました: ${error}`);
@@ -423,6 +425,14 @@ async function handleAnalyzeStop(
 ): Promise<void> {
     await interaction.deferReply();
     const session = sessionManager.getSession(guildId);
+
+    if (session.isStoppingInProgress()) {
+        await interaction.followUp({
+            content: '要約モードはすでに終了処理中です。',
+            flags: MessageFlags.Ephemeral,
+        });
+        return;
+    }
 
     if (session.hasActiveConnection()) {
         runtimeMonitor.logSessionCleanup('manual_analyze_stop', guildId);
@@ -448,6 +458,14 @@ async function handleAnalyzeStopFinal(
     await interaction.deferReply();
     const session = sessionManager.getSession(guildId);
 
+    if (session.isStoppingInProgress()) {
+        await interaction.followUp({
+            content: '要約モードはすでに終了処理中です。',
+            flags: MessageFlags.Ephemeral,
+        });
+        return;
+    }
+
     if (session.hasActiveConnection()) {
         await interaction.followUp('🔄 最終レポートを作成して終了します。しばらくお待ちください...');
         runtimeMonitor.logSessionCleanup('manual_analyze_stop_final', guildId);
@@ -472,7 +490,7 @@ async function handleAnalyzeNow(
 ): Promise<void> {
     const session = sessionManager.getSession(guildId);
 
-    if (session.hasActiveConnection()) {
+    if (session.isRecording) {
         await interaction.reply({ content: '🔄 手動分析を開始しました...' });
         await session.processAudio(true, false);
         return;
@@ -498,9 +516,11 @@ async function handleArticleStart(
     }
 
     const articleSession = vcArticleManager.getSession(guildId);
-    if (articleSession.hasActiveConnection()) {
+    if (articleSession.isBusy()) {
         await interaction.reply({
-            content: '記事化用の録音はすでに実行中です。',
+            content: articleSession.isStoppingInProgress()
+                ? '記事化用の録音は停止処理中です。完了してからもう一度実行してください。'
+                : '記事化用の録音はすでに実行中です。',
             flags: MessageFlags.Ephemeral,
         });
         return;
@@ -545,6 +565,14 @@ async function handleArticleStop(
     guildId: string
 ): Promise<void> {
     const articleSession = vcArticleManager.getSession(guildId);
+    if (articleSession.isStoppingInProgress()) {
+        await interaction.reply({
+            content: '記事化用の録音はすでに停止処理中です。',
+            flags: MessageFlags.Ephemeral,
+        });
+        return;
+    }
+
     if (!articleSession.hasActiveConnection() || !articleSession.isRecording) {
         await interaction.reply({
             content: '記事化用の録音は実行されていません。',
@@ -554,7 +582,7 @@ async function handleArticleStop(
     }
 
     await interaction.deferReply();
-    await interaction.followUp('🔄 録音を停止し、記事候補トピックを抽出しています...');
+    await interaction.followUp('🔄 録音を停止しました。VC から退出し、記事候補トピックを抽出しています...');
     runtimeMonitor.logSessionCleanup('manual_article_stop', guildId);
     const topicResult = await articleSession.stopAndExtractTopics(
         sharedVoiceCoordinator.shouldDestroyArticleConnection(guildId)
@@ -603,7 +631,7 @@ async function handleArticleLoad(
     }
 
     const articleSession = vcArticleManager.getSession(guildId);
-    if (articleSession.hasActiveConnection()) {
+    if (articleSession.isBusy()) {
         await interaction.reply({
             content: '記事化用の録音が実行中です。先に `/article_stop` を実行してください。',
             flags: MessageFlags.Ephemeral,
@@ -775,7 +803,7 @@ async function handleCheck(
     const settings = getGuildSettings(guildId);
     const session = sessionManager.getSession(guildId);
     const articleSession = vcArticleManager.getSession(guildId);
-    const isRecording = session.hasActiveConnection();
+    const isRecording = session.isRecording;
     const liveStatus = session.getStatusSummary();
 
     const modelName = settings.model_name || DEFAULT_MODEL;
@@ -785,9 +813,11 @@ async function handleCheck(
     const remainingLabel = liveStatus.remainingSeconds === null
         ? '停止中'
         : `${Math.floor(liveStatus.remainingSeconds / 60)}分${liveStatus.remainingSeconds % 60}秒`;
-    const statusEmoji = isRecording ? '🔴' : '⏹️';
+    const statusEmoji = isRecording ? '🔴' : session.isStoppingInProgress() ? '🟡' : '⏹️';
     const articleStatus = articleSession.isRecording
         ? '📰 VC記事化録音中'
+        : articleSession.isStoppingInProgress()
+            ? '🟡 記事候補を生成中'
         : articleSession.hasTopicCache()
             ? '🗂️ 記事トピック保持中'
             : '⏹️ 記事化停止中';

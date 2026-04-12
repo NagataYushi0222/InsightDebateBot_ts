@@ -1,0 +1,17 @@
+[Unit]
+Description=Insight Debate Bot (Bun VC Article)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/InsightDebateBot
+Environment=PATH=/home/ubuntu/.bun/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/ubuntu/.bun/bin/bun run src/index_with_vc_article.ts
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/ubuntu/InsightDebateBot/bot.log
+StandardError=append:/home/ubuntu/InsightDebateBot/bot.log
+
+[Install]
+WantedBy=multi-user.target

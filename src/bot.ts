@@ -283,8 +283,10 @@ async function handleAnalyzeStart(
     const session = sessionManager.getSession(guildId);
 
     // 既に録音中か確認
-    if (session.hasActiveConnection()) {
-        await interaction.followUp('既に分析を実行中です。');
+    if (session.isBusy()) {
+        await interaction.followUp(session.isStoppingInProgress()
+            ? '要約モードは終了処理中です。完了してからもう一度実行してください。'
+            : '既に分析を実行中です。');
         return;
     }
 
@@ -356,7 +358,7 @@ async function handleAnalyzeStart(
             voiceChannel.name
         );
     } catch (e) {
-        if (session.hasActiveConnection()) {
+        if (session.hasActiveConnection() || session.isBusy()) {
             await session.stopRecording(true);
         }
         await interaction.followUp(`エラーが発生しました: ${e}`);
@@ -369,6 +371,14 @@ async function handleAnalyzeStop(
 ): Promise<void> {
     await interaction.deferReply();
     const session = sessionManager.getSession(guildId);
+
+    if (session.isStoppingInProgress()) {
+        await interaction.followUp({
+            content: '要約モードはすでに終了処理中です。',
+            flags: MessageFlags.Ephemeral,
+        });
+        return;
+    }
 
     if (session.hasActiveConnection()) {
         await sessionManager.cleanupSession(guildId, true);
@@ -387,6 +397,14 @@ async function handleAnalyzeStopFinal(
 ): Promise<void> {
     await interaction.deferReply();
     const session = sessionManager.getSession(guildId);
+
+    if (session.isStoppingInProgress()) {
+        await interaction.followUp({
+            content: '要約モードはすでに終了処理中です。',
+            flags: MessageFlags.Ephemeral,
+        });
+        return;
+    }
 
     if (session.hasActiveConnection()) {
         await interaction.followUp('🔄 最終レポートを作成して終了します。しばらくお待ちください...');
@@ -407,7 +425,7 @@ async function handleAnalyzeNow(
 ): Promise<void> {
     const session = sessionManager.getSession(guildId);
 
-    if (session.hasActiveConnection()) {
+    if (session.isRecording) {
         await interaction.reply({
             content: '🔄 手動分析を開始しました...'
         });
@@ -544,7 +562,7 @@ async function handleCheck(
 ): Promise<void> {
     const settings = getGuildSettings(guildId);
     const session = sessionManager.getSession(guildId);
-    const isRecording = session.hasActiveConnection();
+    const isRecording = session.isRecording;
     const liveStatus = session.getStatusSummary();
 
     const modelName = settings.model_name || DEFAULT_MODEL;
@@ -554,7 +572,7 @@ async function handleCheck(
     const remainingLabel = liveStatus.remainingSeconds === null
         ? '停止中'
         : `${Math.floor(liveStatus.remainingSeconds / 60)}分${liveStatus.remainingSeconds % 60}秒`;
-    const statusEmoji = isRecording ? '🔴' : '⏹️';
+    const statusEmoji = isRecording ? '🔴' : session.isStoppingInProgress() ? '🟡' : '⏹️';
 
     const embed = [
         '━━━━━━━━━━━━━━━━━━━━━━',

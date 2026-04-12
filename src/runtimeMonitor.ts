@@ -88,6 +88,12 @@ export class RuntimeMonitor {
             ...this.vcArticleManager.listSessionGuildIds(),
         ]);
 
+        for (const guild of this.client.guilds.cache.values()) {
+            if (guild.members.me?.voice.channelId) {
+                guildIds.add(guild.id);
+            }
+        }
+
         if (guildIds.size === 0) {
             return;
         }
@@ -102,14 +108,14 @@ export class RuntimeMonitor {
 
             const analyzeActive = !!analyzeSession?.hasActiveConnection() && analyzeSession.isRecording;
             const articleActive = !!articleSession?.hasActiveConnection() && articleSession.isRecording;
-            if (!analyzeActive && !articleActive && !activeConnection) {
+            const guild = this.client.guilds.cache.get(guildId);
+            const botVoiceChannelId = guild?.members.me?.voice.channelId || null;
+            if (!analyzeActive && !articleActive && !activeConnection && !botVoiceChannelId) {
                 continue;
             }
 
             const targetChannelId = activeConnection?.joinConfig.channelId || null;
-            const guild = this.client.guilds.cache.get(guildId);
             const targetChannel = targetChannelId ? guild?.channels.cache.get(targetChannelId) : null;
-            const botVoiceChannelId = guild?.members.me?.voice.channelId || null;
             const nonBotMembers = targetChannel?.isVoiceBased()
                 ? targetChannel.members.filter((member) => !member.user.bot).size
                 : 0;
@@ -118,6 +124,8 @@ export class RuntimeMonitor {
             const warning =
                 activeConnection && (!botPresent || status === VoiceConnectionStatus.Destroyed)
                     ? ' warning=voice_state_mismatch'
+                    : !activeConnection && botVoiceChannelId
+                        ? ' warning=bot_in_channel_without_active_session'
                     : '';
 
             console.log(

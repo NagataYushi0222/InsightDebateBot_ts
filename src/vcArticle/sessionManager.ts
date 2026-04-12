@@ -48,6 +48,7 @@ export class VcArticleSession {
     private chunkTimer: ReturnType<typeof setInterval> | null = null;
     private chunkSequence = 0;
     private chunkProcessing: Promise<void> = Promise.resolve();
+    private isStopping = false;
     private readonly consumerLabel: string;
     private lastVoiceStats: VoiceConsumerDiagnosticsSnapshot | null = null;
 
@@ -58,6 +59,14 @@ export class VcArticleSession {
 
     hasActiveConnection(): boolean {
         return !!this.voiceConnection && this.voiceConnection.state.status !== VoiceConnectionStatus.Destroyed;
+    }
+
+    isBusy(): boolean {
+        return this.isRecording || this.isStopping;
+    }
+
+    isStoppingInProgress(): boolean {
+        return this.isStopping;
     }
 
     hasTopicCache(): boolean {
@@ -148,54 +157,81 @@ export class VcArticleSession {
             throw new Error('記事化用の録音セッションは開始されていません。');
         }
 
+        this.isStopping = true;
         this.isRecording = false;
         this.detachFromVoiceCapture();
         this.logVoiceStats('stop_and_extract');
         this.clearChunkTimer();
         await this.enqueueChunkProcessing();
 
-        if (this.pendingAudioClips.length === 0) {
-            this.releaseVoiceConnection(destroyConnection);
-            this.resetLiveResources();
-            return { sessionSummary: '録音データがありませんでした。', topics: [] };
-        }
-
-        const archived = saveArchivedSession({
-            guildId: this.guildId,
-            voiceChannelName: this.voiceChannelName,
-            audioClips: this.pendingAudioClips,
-            textEntries: this.textEntries,
-            createdAt: this.sessionStartedAt || new Date(),
-        });
-        this.pendingAudioClips = [];
-
-        const settings = getGuildSettings(this.guildId);
-        const topicResult = await extractArticleTopics(
-            archived.audioClips,
-            archived.textEntries,
-            this.apiKey,
-            settings.model_name
-        );
-        const summaryLabel = updateArchivedSessionSummaryLabel(
-            archived.archiveId,
-            topicResult.sessionSummary || this.voiceChannelName
-        );
-        updateArchivedSessionTopicResult(archived.archiveId, topicResult);
-
-        this.finalized = {
-            archiveId: archived.archiveId,
-            createdAt: archived.createdAt,
-            voiceChannelName: archived.voiceChannelName,
-            summaryLabel,
-            audioClips: archived.audioClips,
-            textEntries: archived.textEntries,
-            topicResult,
-        };
-
         this.releaseVoiceConnection(destroyConnection);
-        this.resetLiveResources();
 
-        return topicResult;
+        const pendingAudioClips = [...this.pendingAudioClips];
+        const textEntries = [...this.textEntries];
+        const voiceChannelName = this.voiceChannelName;
+        const createdAt = this.sessionStartedAt || new Date();
+        const apiKey = this.apiKey;
+        this.recorder = null;
+        this.targetTextChannel = null;
+        this.sessionStartedAt = null;
+        this.pendingAudioClips = [];
+        this.chunkSequence = 0;
+        this.textEntries = [];
+        this.userMap = new Map();
+
+        try {
+            if (pendingAudioClips.length === 0) {
+                return { sessionSummary: '録音データがありませんでした。', topics: [] };
+            }
+
+            const archived = saveArchivedSession({
+                guildId: this.guildId,
+                voiceChannelName,
+                audioClips: pendingAudioClips,
+                textEntries,
+                createdAt,
+            });
+
+            this.finalized = {
+                archiveId: archived.archiveId,
+                createdAt: archived.createdAt,
+                voiceChannelName: archived.voiceChannelName,
+                summaryLabel: archived.summaryLabel,
+                audioClips: archived.audioClips,
+                textEntries: archived.textEntries,
+                topicResult: archived.topicResult,
+            };
+
+            const settings = getGuildSettings(this.guildId);
+            const topicResult = await extractArticleTopics(
+                archived.audioClips,
+                archived.textEntries,
+                apiKey,
+                settings.model_name
+            );
+            const summaryLabel = updateArchivedSessionSummaryLabel(
+                archived.archiveId,
+                topicResult.sessionSummary || voiceChannelName
+            );
+            updateArchivedSessionTopicResult(archived.archiveId, topicResult);
+
+            this.finalized = {
+                archiveId: archived.archiveId,
+                createdAt: archived.createdAt,
+                voiceChannelName: archived.voiceChannelName,
+                summaryLabel,
+                audioClips: archived.audioClips,
+                textEntries: archived.textEntries,
+                topicResult,
+            };
+
+            return topicResult;
+        } catch (error) {
+            cleanupFiles(pendingAudioClips.map((clip) => clip.filePath));
+            throw error;
+        } finally {
+            this.isStopping = false;
+        }
     }
 
     async generateArticle(topicId: number): Promise<string> {
@@ -264,6 +300,7 @@ export class VcArticleSession {
     }
 
     async discard(destroyConnection: boolean = true): Promise<void> {
+        this.isStopping = false;
         this.isRecording = false;
         this.detachFromVoiceCapture();
         this.logVoiceStats('discard');
@@ -277,6 +314,7 @@ export class VcArticleSession {
     handleDestroyedConnection(connection: VoiceConnection): boolean {
         if (this.voiceConnection !== connection) return false;
         this.isRecording = false;
+        this.isStopping = false;
         this.detachFromVoiceCapture();
         this.logVoiceStats('connection_destroyed');
         this.clearChunkTimer();
@@ -286,10 +324,12 @@ export class VcArticleSession {
     }
 
     private releaseVoiceConnection(destroyConnection: boolean): void {
-        if (destroyConnection && this.voiceConnection && this.voiceConnection.state.status !== VoiceConnectionStatus.Destroyed) {
-            this.voiceConnection.destroy();
-        }
+        const connection = this.voiceConnection;
         this.voiceConnection = null;
+
+        if (destroyConnection && connection && connection.state.status !== VoiceConnectionStatus.Destroyed) {
+            connection.destroy();
+        }
     }
 
     private resetLiveResources(): void {
