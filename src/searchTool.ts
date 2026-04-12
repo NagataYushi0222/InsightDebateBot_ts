@@ -1,3 +1,6 @@
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+
 export interface WebSearchResult {
     title: string;
     url: string;
@@ -12,6 +15,7 @@ const SEARCH_REQUEST_HEADERS = {
 const SEARCH_RESULT_SCAN_LIMIT = 12;
 const URL_VALIDATION_TIMEOUT_MS = 8_000;
 const SEARCH_FALLBACK_QUERY_LIMIT = 3;
+const PYTHON_SEARCH_TIMEOUT_MS = 15_000;
 const SOFT_404_PATTERNS = [
     /404/i,
     /page not found/i,
@@ -22,6 +26,24 @@ const SOFT_404_PATTERNS = [
     /指定されたページ.*見つかりません/i,
     /ファイルが存在しません/i,
 ];
+const execFileAsync = promisify(execFile);
+const PYTHON_DDG_FETCH_SCRIPT = `
+import sys
+import urllib.parse
+import urllib.request
+
+query = sys.argv[1]
+url = "https://duckduckgo.com/lite/?q=" + urllib.parse.quote(query)
+request = urllib.request.Request(
+    url,
+    headers={
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+    },
+)
+with urllib.request.urlopen(request, timeout=15) as response:
+    print(response.read().decode("utf-8", "ignore"))
+`;
 
 function decodeHtml(text: string): string {
     return text
@@ -99,6 +121,13 @@ function looksLikeSoft404Page(text: string): boolean {
     return SOFT_404_PATTERNS.some((pattern) => pattern.test(normalized));
 }
 
+function isDuckDuckGoChallengePage(html: string): boolean {
+    const normalized = html.slice(0, 12_000);
+    return /Unfortunately,\s*bots use DuckDuckGo too\./i.test(normalized)
+        || /anomaly-modal__title/i.test(normalized)
+        || /challenge-form/i.test(normalized);
+}
+
 /**
  * 参考URLとして載せる前に、そのURLが少なくとも今アクセス可能かを確認する。
  *
@@ -152,7 +181,27 @@ async function fetchDuckDuckGoHtml(query: string): Promise<string> {
         throw new Error(`Search request failed with status ${response.status}`);
     }
 
-    return response.text();
+    const html = await response.text();
+    if (!isDuckDuckGoChallengePage(html)) {
+        return html;
+    }
+
+    // Bun の fetch だと DuckDuckGo に bot 判定されることがある。
+    // その場合だけ Python 標準ライブラリへフォールバックして、結果HTMLの取得を試す。
+    try {
+        const { stdout } = await execFileAsync(
+            'python3',
+            ['-c', PYTHON_DDG_FETCH_SCRIPT, query],
+            { timeout: PYTHON_SEARCH_TIMEOUT_MS, maxBuffer: 1024 * 1024 * 2 },
+        );
+        if (stdout && !isDuckDuckGoChallengePage(stdout)) {
+            return stdout;
+        }
+    } catch (error) {
+        console.error(`[Web Search] Python fallback failed for "${query}":`, error);
+    }
+
+    return html;
 }
 
 function parseDuckDuckGoResults(html: string): WebSearchResult[] {
