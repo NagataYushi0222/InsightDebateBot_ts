@@ -1,14 +1,13 @@
-import {
-    createPartFromFunctionCall,
-    createPartFromFunctionResponse,
-    FunctionCallingConfigMode,
-    GoogleGenAI,
-} from '@google/genai';
+import { GoogleGenAI } from '@google/genai';
 import fs from 'fs';
 import { GEMINI_API_KEY, GEMINI_MODEL_FLASH } from './config';
-import { searchWeb } from './searchTool';
+import {
+    extractUrlsFromSearchTrace,
+    generateContentWithWebSearch,
+    SearchTrace,
+} from './geminiWebSearch';
 
-function extractReferenceUrls(response: any): string[] {
+function extractGroundingUrls(response: any): string[] {
     const chunks = response?.candidates?.[0]?.groundingMetadata?.groundingChunks;
     if (!Array.isArray(chunks)) return [];
 
@@ -19,19 +18,36 @@ function extractReferenceUrls(response: any): string[] {
     return Array.from(new Set(urls));
 }
 
-function appendReferenceUrls(reportText: string, response: any): string {
-    const urls = extractReferenceUrls(response);
-    if (reportText.includes('【参考URL】')) {
-        return reportText;
+function extractInlineUrls(text: string): string[] {
+    const matches = text.match(/https?:\/\/[^\s<>"')\]]+/g);
+    return matches ? Array.from(new Set(matches)) : [];
+}
+
+function upsertReferenceUrls(reportText: string, urls: string[]): string {
+    const uniqueUrls = Array.from(new Set(urls));
+    if (uniqueUrls.length === 0) return reportText;
+
+    const referenceSection = `【参考URL】\n${uniqueUrls.map((url) => `- ${url}`).join('\n')}`;
+    const referenceSectionPattern = /【参考URL】[\s\S]*$/;
+
+    if (referenceSectionPattern.test(reportText)) {
+        return reportText.replace(referenceSectionPattern, referenceSection);
     }
 
+    return `${reportText}\n\n${referenceSection}`;
+}
+
+function appendReferenceUrls(reportText: string, response: any, searchTrace: SearchTrace[]): string {
+    const urls = [
+        ...extractInlineUrls(reportText),
+        ...extractUrlsFromSearchTrace(searchTrace),
+        ...extractGroundingUrls(response),
+    ];
     if (urls.length === 0) {
         return reportText;
     }
 
-    const referenceSection = `【参考URL】\n${urls.map((url) => `- ${url}`).join('\n')}`;
-
-    return `${reportText}\n\n${referenceSection}`;
+    return upsertReferenceUrls(reportText, urls);
 }
 
 /**
@@ -67,9 +83,10 @@ const PROMPTS: Record<string, string> = {
 1. 誰が何について話しているかを明確にしてください。
 1.5. **各音声ファイルの直前に書かれた「発言者ラベル」が、そのファイルの唯一の話者です。別ファイルの発言をその人に混ぜないでください。話者が確信できない内容は「不明」としてください。**
 2. 専門用語や文脈依存の単語には簡単な補足を加えてください。
-3. **【重要】音声が無音、ノイズのみ、または意味のある会話が含まれていない場合は、無理に分析せず、「特に新しい議論はありませんでした。」とだけ出力してください。**
-4. 「前回の文脈」はあくまで参考情報です。**今回提供された音声ファイルに含まれていない発言を、前回の文脈から捏造してレポートに含めないでください。**
-5. **ある参加者の発言を別の参加者に割り当てることは禁止です。**
+3. **提供された Web 検索機能を必ず 1 回以上使ってください**。時事情報、制度、製品、固有名詞、数値、ニュース性のある話題は検索で確認してください。
+4. **【重要】音声が無音、ノイズのみ、または意味のある会話が含まれていない場合は、無理に分析せず、「特に新しい議論はありませんでした。」とだけ出力してください。**
+5. 「前回の文脈」はあくまで参考情報です。**今回提供された音声ファイルに含まれていない発言を、前回の文脈から捏造してレポートに含めないでください。**
+6. **ある参加者の発言を別の参加者に割り当てることは禁止です。**
 
 出力項目:
 【現在のトピック】: (今何を話しているか、数行でシンプルに)
@@ -129,127 +146,6 @@ async function waitForFilesActive(
         }
     }
     console.log('...all files ready');
-}
-
-async function generateContentWithSearchTool(
-    ai: GoogleGenAI,
-    model: string,
-    parts: any[],
-    isThinkingModel: boolean,
-) {
-    const contents: any[] = [
-        {
-            role: 'user',
-            parts,
-        },
-    ];
-
-    const functionDeclaration = {
-        name: 'search_web',
-        description: 'Web検索を実行して、最新の参考URLと要約を返します。',
-        parametersJsonSchema: {
-            type: 'object',
-            properties: {
-                query: {
-                    type: 'string',
-                    description: '検索したいクエリ',
-                },
-                limit: {
-                    type: 'integer',
-                    description: '取得したい件数。1から5。',
-                    minimum: 1,
-                    maximum: 5,
-                },
-            },
-            required: ['query'],
-        },
-    };
-
-    for (let step = 0; step < 4; step++) {
-        const configObj: any = {
-            toolConfig: {
-                functionCallingConfig: {
-                    mode: FunctionCallingConfigMode.AUTO,
-                },
-            },
-            tools: [{ functionDeclarations: [functionDeclaration] }],
-        };
-        if (isThinkingModel) {
-            configObj.thinkingConfig = {
-                thinkingLevel: 'HIGH' as any,
-            };
-        }
-
-        const response = await ai.models.generateContent({
-            model,
-            contents,
-            config: configObj,
-        });
-
-        const functionCalls = response.functionCalls || [];
-        if (functionCalls.length === 0) {
-            return response;
-        }
-
-        contents.push({
-            role: 'model',
-            parts: functionCalls.map((call: any) =>
-                createPartFromFunctionCall(call.name, (call.args || {}) as Record<string, unknown>)
-            ),
-        });
-
-        const functionResponseParts = [];
-        for (const call of functionCalls) {
-            if (call.name !== 'search_web') {
-                functionResponseParts.push(
-                    createPartFromFunctionResponse(call.id || '', call.name, {
-                        error: `Unsupported function: ${call.name}`,
-                    }),
-                );
-                continue;
-            }
-
-            const query = typeof call.args?.query === 'string' ? call.args.query.trim() : '';
-            const limit =
-                typeof call.args?.limit === 'number' && Number.isFinite(call.args.limit)
-                    ? call.args.limit
-                    : 5;
-
-            if (!query) {
-                functionResponseParts.push(
-                    createPartFromFunctionResponse(call.id || '', call.name, {
-                        error: 'query is required',
-                    }),
-                );
-                continue;
-            }
-
-            try {
-                const results = await searchWeb(query, limit);
-                functionResponseParts.push(
-                    createPartFromFunctionResponse(call.id || '', call.name, {
-                        output: {
-                            query,
-                            results,
-                        },
-                    }),
-                );
-            } catch (error) {
-                functionResponseParts.push(
-                    createPartFromFunctionResponse(call.id || '', call.name, {
-                        error: String(error),
-                    }),
-                );
-            }
-        }
-
-        contents.push({
-            role: 'user',
-            parts: functionResponseParts,
-        });
-    }
-
-    throw new Error('検索関数の呼び出し回数が上限に達しました。');
 }
 
 /**
@@ -343,16 +239,19 @@ export async function analyzeDiscussion(
         const isThinkingModel = useModel.includes('gemini-3.0') || useModel.includes('gemini-3.1');
 
         try {
-            const response = await generateContentWithSearchTool(
+            const { response, searchTrace } = await generateContentWithWebSearch(
                 ai,
                 useModel,
                 parts,
-                isThinkingModel,
+                {
+                    isThinkingModel,
+                    forceSearch: true,
+                },
             );
 
             // クリーンアップ
             for (const f of uploadedFiles) await ai.files.delete({ name: f.name }).catch(() => { });
-            return appendReferenceUrls(response.text || '分析結果が空でした。', response);
+            return appendReferenceUrls(response.text || '分析結果が空でした。', response, searchTrace);
 
         } catch (e: any) {
             throw e;

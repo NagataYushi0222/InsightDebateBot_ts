@@ -7,6 +7,7 @@ import { cleanupFiles, convertToMp3 } from '../audioProcessor';
 import { getGuildSettings } from '../database';
 import { UserAudioRecorder } from '../recorder';
 import { attachVoiceCaptureConsumer } from '../voiceCaptureHub';
+import type { VoiceConsumerDiagnosticsSnapshot } from '../voiceDiagnostics';
 import { extractArticleTopics, generateArticleFromTopic } from './ai';
 import {
     loadArchivedSession,
@@ -47,9 +48,12 @@ export class VcArticleSession {
     private chunkTimer: ReturnType<typeof setInterval> | null = null;
     private chunkSequence = 0;
     private chunkProcessing: Promise<void> = Promise.resolve();
+    private readonly consumerLabel: string;
+    private lastVoiceStats: VoiceConsumerDiagnosticsSnapshot | null = null;
 
     constructor(guildId: string, _bot: Client) {
         this.guildId = guildId;
+        this.consumerLabel = `article:${guildId}`;
     }
 
     hasActiveConnection(): boolean {
@@ -98,6 +102,7 @@ export class VcArticleSession {
         this.pendingAudioClips = [];
         this.chunkSequence = 0;
         this.chunkProcessing = Promise.resolve();
+        this.lastVoiceStats = null;
         guild.members.cache.forEach((member) => {
             if (member.voice.channelId === connection.joinConfig.channelId && !member.user.bot) {
                 this.userMap.set(member.id, member.displayName);
@@ -108,6 +113,7 @@ export class VcArticleSession {
         }, ARTICLE_CHUNK_INTERVAL_MS);
         this.detachFromVoiceCapture();
         this.detachVoiceCapture = attachVoiceCaptureConsumer(connection, {
+            consumerLabel: this.consumerLabel,
             onSpeakerStart: (userId) => {
                 this.rememberDisplayName(guild, userId);
             },
@@ -117,6 +123,9 @@ export class VcArticleSession {
                     this.rememberDisplayName(guild, userId);
                 }
                 this.recorder.write(userId, pcmData);
+            },
+            onStats: (stats) => {
+                this.lastVoiceStats = stats;
             },
         });
     }
@@ -141,6 +150,7 @@ export class VcArticleSession {
 
         this.isRecording = false;
         this.detachFromVoiceCapture();
+        this.logVoiceStats('stop_and_extract');
         this.clearChunkTimer();
         await this.enqueueChunkProcessing();
 
@@ -256,6 +266,7 @@ export class VcArticleSession {
     async discard(destroyConnection: boolean = true): Promise<void> {
         this.isRecording = false;
         this.detachFromVoiceCapture();
+        this.logVoiceStats('discard');
         this.clearChunkTimer();
         await this.chunkProcessing.catch(() => undefined);
         this.releaseVoiceConnection(destroyConnection);
@@ -267,6 +278,7 @@ export class VcArticleSession {
         if (this.voiceConnection !== connection) return false;
         this.isRecording = false;
         this.detachFromVoiceCapture();
+        this.logVoiceStats('connection_destroyed');
         this.clearChunkTimer();
         this.voiceConnection = null;
         this.resetLiveResources();
@@ -346,6 +358,33 @@ export class VcArticleSession {
         this.detachVoiceCapture = null;
     }
 
+    private logVoiceStats(reason: string): void {
+        if (!this.lastVoiceStats) {
+            console.log(`[Voice Metrics][${this.consumerLabel}][${reason}] no stats captured`);
+            return;
+        }
+
+        if (this.lastVoiceStats.users.length === 0) {
+            console.log(`[Voice Metrics][${this.consumerLabel}][${reason}] no user audio captured`);
+            return;
+        }
+
+        for (const user of this.lastVoiceStats.users) {
+            console.log(
+                [
+                    `[Voice Metrics][${this.consumerLabel}][${reason}]`,
+                    `user=${user.userId}`,
+                    `dave_ok=${user.daveDecryptSuccesses}`,
+                    `dave_fail=${user.daveDecryptFailures}`,
+                    `opus_ok=${user.opusPacketsReceived}`,
+                    `opus_decode_fail=${user.opusDecodeFailures}`,
+                    `pcm_packets=${user.pcmPacketsDelivered}`,
+                    `pcm_bytes=${user.pcmBytesDelivered}`,
+                ].join(' '),
+            );
+        }
+    }
+
     private rememberDisplayName(guild: Guild, userId: string): void {
         const member = guild.members.cache.get(userId);
         if (member && !member.user.bot) {
@@ -375,6 +414,14 @@ export class VcArticleSessionManager {
             this.sessions.set(guildId, session);
         }
         return session;
+    }
+
+    getExistingSession(guildId: string): VcArticleSession | null {
+        return this.sessions.get(guildId) || null;
+    }
+
+    listSessionGuildIds(): string[] {
+        return Array.from(this.sessions.keys());
     }
 
     async cleanupSession(guildId: string, destroyConnection: boolean = true): Promise<void> {

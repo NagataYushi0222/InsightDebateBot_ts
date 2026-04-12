@@ -1,6 +1,7 @@
 import fs from 'fs';
 import { GoogleGenAI } from '@google/genai';
 import { GEMINI_API_KEY, GEMINI_MODEL_FLASH } from '../config';
+import { generateContentWithWebSearch } from '../geminiWebSearch';
 import { ARTICLE_GENERATION_PROMPT, TOPIC_EXTRACTION_PROMPT } from './prompts';
 import { StoredAudioClip } from './storage';
 import { ArticleTopic, TextChatEntry, TopicExtractionResult } from './types';
@@ -156,22 +157,20 @@ export async function extractArticleTopics(
     try {
         await waitForFilesActive(ai, uploadedFiles);
 
-        const response = await ai.models.generateContent({
-            model: useModel,
-            contents: [
-                {
-                    role: 'user',
-                    parts: [
-                        { text: TOPIC_EXTRACTION_PROMPT },
-                        ...buildSharedParts(audioClips, textEntries),
-                        ...audioParts,
-                    ],
-                },
+        const { response } = await generateContentWithWebSearch(
+            ai,
+            useModel,
+            [
+                { text: TOPIC_EXTRACTION_PROMPT },
+                ...buildSharedParts(audioClips, textEntries),
+                ...audioParts,
             ],
-            config: {
+            {
                 responseMimeType: 'application/json',
-            } as any,
-        });
+                isThinkingModel: useModel.includes('gemini-3.0') || useModel.includes('gemini-3.1'),
+                forceSearch: true,
+            },
+        );
 
         return toJsonResult(response.text || '{"sessionSummary":"","topics":[]}');
     } finally {
@@ -201,22 +200,22 @@ export async function generateArticleFromTopic(
     try {
         await waitForFilesActive(ai, uploadedFiles);
 
-        const response = await ai.models.generateContent({
-            model: useModel,
-            contents: [
+        const { response } = await generateContentWithWebSearch(
+            ai,
+            useModel,
+            [
+                { text: ARTICLE_GENERATION_PROMPT },
                 {
-                    role: 'user',
-                    parts: [
-                        { text: ARTICLE_GENERATION_PROMPT },
-                        {
-                            text: `選択されたトピック:\n${JSON.stringify(topic, null, 2)}`,
-                        },
-                        ...buildSharedParts(audioClips, textEntries),
-                        ...audioParts,
-                    ],
+                    text: `選択されたトピック:\n${JSON.stringify(topic, null, 2)}`,
                 },
+                ...buildSharedParts(audioClips, textEntries),
+                ...audioParts,
             ],
-        });
+            {
+                isThinkingModel: useModel.includes('gemini-3.0') || useModel.includes('gemini-3.1'),
+                forceSearch: true,
+            },
+        );
 
         return response.text || '記事を生成できませんでした。';
     } finally {

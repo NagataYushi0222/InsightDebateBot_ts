@@ -1,6 +1,7 @@
 import {
     entersState,
     joinVoiceChannel,
+    VoiceConnectionDisconnectReason,
     VoiceConnection,
     VoiceConnectionStatus,
 } from '@ovencord/voice';
@@ -23,6 +24,12 @@ interface MutableNetworkingState {
         reinit?: () => void;
         reinitializing?: boolean;
     };
+}
+
+interface VoiceStateWithDisconnectDetails {
+    status: VoiceConnectionStatus;
+    reason?: VoiceConnectionDisconnectReason;
+    closeCode?: number;
 }
 
 export class SharedVoiceCoordinator {
@@ -147,10 +154,28 @@ export class SharedVoiceCoordinator {
         this.managedVoiceConnections.add(connection);
 
         connection.on('stateChange', (oldState, newState) => {
-            console.log(`[Shared Voice] ${oldState.status} -> ${newState.status}`);
+            console.log(
+                [
+                    '[Shared Voice]',
+                    `guild=${guildId}`,
+                    `channel=${connection.joinConfig.channelId}`,
+                    `${oldState.status} -> ${newState.status}`,
+                    this.describeVoiceState(newState as VoiceStateWithDisconnectDetails),
+                    `rejoin_attempts=${connection.rejoinAttempts}`,
+                ].join(' '),
+            );
             if (newState.status === VoiceConnectionStatus.Disconnected) {
+                console.warn(
+                    `[Shared Voice] guild=${guildId} disconnected; waiting up to 5s for reconnect`,
+                );
                 entersState(connection, VoiceConnectionStatus.Connecting, 5_000)
-                    .catch(() => connection.destroy());
+                    .then(() => {
+                        console.log(`[Shared Voice] guild=${guildId} reconnect attempt reached connecting`);
+                    })
+                    .catch((error) => {
+                        console.error(`[Shared Voice] guild=${guildId} reconnect failed, destroying connection:`, error);
+                        connection.destroy();
+                    });
             }
             if (newState.status === VoiceConnectionStatus.Destroyed) {
                 this.sessionManager.cleanupDestroyedConnection(guildId, connection);
@@ -241,5 +266,17 @@ export class SharedVoiceCoordinator {
         this.lastDaveReinitAt.set(connection, now);
         console.log(`[Voice Seed] Reinitializing DAVE session after participant sync for channel ${channelId}`);
         daveSession.reinit();
+    }
+
+    private describeVoiceState(state: VoiceStateWithDisconnectDetails): string {
+        if (state.status !== VoiceConnectionStatus.Disconnected) {
+            return '';
+        }
+
+        const reasonLabel = state.reason !== undefined
+            ? VoiceConnectionDisconnectReason[state.reason]
+            : 'unknown';
+        const closeCode = state.closeCode !== undefined ? ` close_code=${state.closeCode}` : '';
+        return `reason=${reasonLabel}${closeCode}`;
     }
 }

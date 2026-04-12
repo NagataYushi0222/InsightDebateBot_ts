@@ -8,6 +8,7 @@ import { convertToMp3, cleanupFiles } from './audioProcessor';
 import { analyzeDiscussion } from './analyzer';
 import { getGuildSettings, GuildSettings } from './database';
 import { attachVoiceCaptureConsumer } from './voiceCaptureHub';
+import type { VoiceConsumerDiagnosticsSnapshot } from './voiceDiagnostics';
 
 /**
  * ギルドごとのセッション
@@ -31,11 +32,14 @@ export class GuildSession {
     private currentTaskLabel: string = '待機中';
     private lastStatusContent: string = '';
     private isProcessingAudio: boolean = false;
+    private readonly consumerLabel: string;
+    private lastVoiceStats: VoiceConsumerDiagnosticsSnapshot | null = null;
 
     constructor(guildId: string, bot: Client) {
         this.guildId = guildId;
         this.bot = bot;
         this.settings = getGuildSettings(guildId);
+        this.consumerLabel = `analyze:${guildId}`;
     }
 
     /**
@@ -55,15 +59,20 @@ export class GuildSession {
         this.apiKey = apiKey;
         this.statusMessage = null;
         this.voiceChannelName = voiceChannelName;
+        this.lastVoiceStats = null;
         this.cycleStartedAt = Date.now();
         this.currentStatus = '録音中';
         this.currentTaskLabel = '次回の自動分析を待機中';
         await this.refreshStatusMessage(undefined, true);
         this.detachFromVoiceCapture();
         this.detachVoiceCapture = attachVoiceCaptureConsumer(connection, {
+            consumerLabel: this.consumerLabel,
             onAudio: (userId, pcmData) => {
                 if (!this.isRecording || !this.recorder) return;
                 this.recorder.write(userId, pcmData);
+            },
+            onStats: (stats) => {
+                this.lastVoiceStats = stats;
             },
         });
 
@@ -83,6 +92,7 @@ export class GuildSession {
         this.isRecording = false;
         this.isProcessingAudio = false;
         this.detachFromVoiceCapture();
+        this.logVoiceStats('connection_destroyed');
         this.voiceConnection = null;
         this.recorder = null;
         this.statusMessage = null;
@@ -106,6 +116,7 @@ export class GuildSession {
         const activeConnection = this.voiceConnection;
         const shouldRunFinal = !skipFinal && !!activeConnection && !!this.recorder;
         this.detachFromVoiceCapture();
+        this.logVoiceStats(skipFinal ? 'stop_without_final' : 'stop_with_final');
         this.isRecording = false;
 
         if (shouldRunFinal) {
@@ -494,6 +505,33 @@ export class GuildSession {
         this.detachVoiceCapture();
         this.detachVoiceCapture = null;
     }
+
+    private logVoiceStats(reason: string): void {
+        if (!this.lastVoiceStats) {
+            console.log(`[Voice Metrics][${this.consumerLabel}][${reason}] no stats captured`);
+            return;
+        }
+
+        if (this.lastVoiceStats.users.length === 0) {
+            console.log(`[Voice Metrics][${this.consumerLabel}][${reason}] no user audio captured`);
+            return;
+        }
+
+        for (const user of this.lastVoiceStats.users) {
+            console.log(
+                [
+                    `[Voice Metrics][${this.consumerLabel}][${reason}]`,
+                    `user=${user.userId}`,
+                    `dave_ok=${user.daveDecryptSuccesses}`,
+                    `dave_fail=${user.daveDecryptFailures}`,
+                    `opus_ok=${user.opusPacketsReceived}`,
+                    `opus_decode_fail=${user.opusDecodeFailures}`,
+                    `pcm_packets=${user.pcmPacketsDelivered}`,
+                    `pcm_bytes=${user.pcmBytesDelivered}`,
+                ].join(' '),
+            );
+        }
+    }
 }
 
 /**
@@ -512,6 +550,14 @@ export class SessionManager {
             this.sessions.set(guildId, new GuildSession(guildId, this.bot));
         }
         return this.sessions.get(guildId)!;
+    }
+
+    getExistingSession(guildId: string): GuildSession | null {
+        return this.sessions.get(guildId) || null;
+    }
+
+    listSessionGuildIds(): string[] {
+        return Array.from(this.sessions.keys());
     }
 
     async cleanupSession(

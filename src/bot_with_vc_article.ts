@@ -28,6 +28,7 @@ import { SessionManager } from './sessionManager';
 import { VcArticleSessionManager } from './vcArticle/sessionManager';
 import { ArchivedSessionSummary, listArchivedSessions } from './vcArticle/storage';
 import { SharedVoiceCoordinator } from './sharedVoiceCoordinator';
+import { RuntimeMonitor } from './runtimeMonitor';
 
 initDb();
 
@@ -43,6 +44,7 @@ const client = new Client({
 const sessionManager = new SessionManager(client);
 const vcArticleManager = new VcArticleSessionManager(client);
 const sharedVoiceCoordinator = new SharedVoiceCoordinator(client, sessionManager, vcArticleManager);
+const runtimeMonitor = new RuntimeMonitor(client, sessionManager, vcArticleManager, sharedVoiceCoordinator);
 
 const commands = [
     new SlashCommandBuilder()
@@ -284,7 +286,14 @@ client.on('interactionCreate', async (interaction) => {
 });
 
 client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
-    if (oldState.member?.id === client.user?.id) return;
+    if (oldState.member?.id === client.user?.id) {
+        runtimeMonitor.logBotVoiceStateChange(
+            oldState.guild.id,
+            oldState.channelId,
+            newState.channelId,
+        );
+        return;
+    }
 
     const guildId = oldState.guild.id;
     sharedVoiceCoordinator.syncActiveConnectionParticipants(guildId);
@@ -319,6 +328,7 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
     }
 
     if (analyzeActive) {
+        runtimeMonitor.logSessionCleanup('all_members_left_analyze', guildId);
         await sessionManager.cleanupSession(guildId, false, !sharedConnection);
     }
 
@@ -328,12 +338,14 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
 
     const articleTextChannel = articleSession.targetTextChannel;
     if (articleTextChannel) {
+        runtimeMonitor.logSessionCleanup('all_members_left_article', guildId);
         const topicResult = await articleSession.stopAndExtractTopics(true);
         await sendChannelMessageInChunks(
             articleTextChannel,
             formatTopicsMessage(topicResult, articleSession.getActiveArchiveId())
         );
     } else {
+        runtimeMonitor.logSessionCleanup('all_members_left_article_without_text_channel', guildId);
         await vcArticleManager.cleanupSession(guildId, true);
     }
 });
@@ -413,6 +425,7 @@ async function handleAnalyzeStop(
     const session = sessionManager.getSession(guildId);
 
     if (session.hasActiveConnection()) {
+        runtimeMonitor.logSessionCleanup('manual_analyze_stop', guildId);
         await sessionManager.cleanupSession(
             guildId,
             true,
@@ -437,6 +450,7 @@ async function handleAnalyzeStopFinal(
 
     if (session.hasActiveConnection()) {
         await interaction.followUp('🔄 最終レポートを作成して終了します。しばらくお待ちください...');
+        runtimeMonitor.logSessionCleanup('manual_analyze_stop_final', guildId);
         await sessionManager.cleanupSession(
             guildId,
             false,
@@ -541,6 +555,7 @@ async function handleArticleStop(
 
     await interaction.deferReply();
     await interaction.followUp('🔄 録音を停止し、記事候補トピックを抽出しています...');
+    runtimeMonitor.logSessionCleanup('manual_article_stop', guildId);
     const topicResult = await articleSession.stopAndExtractTopics(
         sharedVoiceCoordinator.shouldDestroyArticleConnection(guildId)
     );
@@ -627,6 +642,7 @@ async function handleArticleDiscard(
     interaction: ChatInputCommandInteraction,
     guildId: string
 ): Promise<void> {
+    runtimeMonitor.logSessionCleanup('manual_article_discard', guildId);
     await vcArticleManager.cleanupSession(
         guildId,
         sharedVoiceCoordinator.shouldDestroyArticleConnection(guildId)
@@ -941,5 +957,6 @@ export function runBotWithVcArticle(): void {
         console.error('No DISCORD_TOKEN provided. Exiting.');
         process.exit(1);
     }
+    runtimeMonitor.start();
     client.login(DISCORD_TOKEN);
 }

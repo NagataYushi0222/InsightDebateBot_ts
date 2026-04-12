@@ -5,22 +5,36 @@ import {
     VoiceConnectionStatus,
 } from '@ovencord/voice';
 import { OpusDecoder } from './opusDecoder';
+import { ensureVoiceConnectionDiagnostics } from './voiceDiagnostics';
+import type { VoiceConsumerDiagnosticsSnapshot } from './voiceDiagnostics';
 
 export interface VoiceCaptureConsumer {
+    consumerLabel: string;
     onAudio(userId: string, pcmData: Buffer): void;
     onSpeakerStart?(userId: string): void;
+    onStats?(stats: VoiceConsumerDiagnosticsSnapshot): void;
 }
 
 class VoiceCaptureHub {
     private readonly consumers = new Set<VoiceCaptureConsumer>();
     private readonly activeReaders = new Set<string>();
     private readonly decoders = new Map<string, OpusDecoder>();
+    private readonly consumerBaselines = new Map<VoiceCaptureConsumer, Map<string, {
+        daveDecryptFailures: number;
+        daveDecryptSuccesses: number;
+        opusPacketsReceived: number;
+        opusDecodeFailures: number;
+        pcmPacketsDelivered: number;
+        pcmBytesDelivered: number;
+    }>>();
+    private readonly diagnostics;
     private isDisposed = false;
 
     constructor(
         private readonly connection: VoiceConnection,
         private readonly onDispose: () => void
     ) {
+        this.diagnostics = ensureVoiceConnectionDiagnostics(connection);
         this.handleSpeakingStart = this.handleSpeakingStart.bind(this);
         this.handleStateChange = this.handleStateChange.bind(this);
 
@@ -30,9 +44,15 @@ class VoiceCaptureHub {
 
     addConsumer(consumer: VoiceCaptureConsumer): () => void {
         this.consumers.add(consumer);
+        this.consumerBaselines.set(
+            consumer,
+            this.diagnostics.captureSnapshot(consumer.consumerLabel),
+        );
 
         return () => {
+            this.emitConsumerStats(consumer);
             this.consumers.delete(consumer);
+            this.consumerBaselines.delete(consumer);
             if (this.consumers.size === 0) {
                 this.dispose();
             }
@@ -40,6 +60,9 @@ class VoiceCaptureHub {
     }
 
     private handleStateChange(_: unknown, newState: { status: VoiceConnectionStatus }): void {
+        if (newState.status === VoiceConnectionStatus.Ready) {
+            this.diagnostics.ensureDaveInstrumentation();
+        }
         if (newState.status === VoiceConnectionStatus.Destroyed) {
             this.dispose();
         }
@@ -84,14 +107,21 @@ class VoiceCaptureHub {
                         break;
                     }
 
+                    this.diagnostics.recordOpusPacket(userId);
                     const pcmData = decoder.decode(Buffer.from(value));
                     if (!pcmData) {
+                        this.diagnostics.recordOpusDecodeFailure(userId);
                         continue;
                     }
 
                     for (const consumer of this.consumers) {
                         try {
                             consumer.onAudio(userId, pcmData);
+                            this.diagnostics.recordPcmDelivery(
+                                userId,
+                                consumer.consumerLabel,
+                                pcmData.byteLength,
+                            );
                         } catch (error) {
                             console.error(`Voice capture consumer error for ${userId}:`, error);
                         }
@@ -118,14 +148,24 @@ class VoiceCaptureHub {
         this.connection.receiver.speaking.removeListener('start', this.handleSpeakingStart);
         this.connection.removeListener('stateChange', this.handleStateChange);
 
+        for (const consumer of this.consumers) {
+            this.emitConsumerStats(consumer);
+        }
         for (const decoder of this.decoders.values()) {
             decoder.destroy();
         }
 
         this.decoders.clear();
         this.activeReaders.clear();
+        this.consumerBaselines.clear();
         this.consumers.clear();
         this.onDispose();
+    }
+
+    private emitConsumerStats(consumer: VoiceCaptureConsumer): void {
+        const baseline = this.consumerBaselines.get(consumer) || null;
+        const snapshot = this.diagnostics.buildConsumerSnapshot(consumer.consumerLabel, baseline);
+        consumer.onStats?.(snapshot);
     }
 }
 
