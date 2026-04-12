@@ -2,13 +2,15 @@ import {
     VoiceConnection,
     VoiceConnectionStatus,
 } from '@ovencord/voice';
-import { Client, TextChannel, Guild } from 'discord.js';
+import { Client, TextChannel, Guild, Message } from 'discord.js';
 import { UserAudioRecorder } from './recorder';
 import { convertToMp3, cleanupFiles } from './audioProcessor';
 import { analyzeDiscussion } from './analyzer';
 import { getGuildSettings, GuildSettings } from './database';
 import { attachVoiceCaptureConsumer } from './voiceCaptureHub';
 import type { VoiceConsumerDiagnosticsSnapshot } from './voiceDiagnostics';
+
+type StatusAnchorHandler = (guildId: string, message: Message) => Promise<void> | void;
 
 /**
  * ギルドごとのセッション
@@ -39,12 +41,17 @@ export class GuildSession {
     private processingPromise: Promise<void> | null = null;
     private readonly consumerLabel: string;
     private lastVoiceStats: VoiceConsumerDiagnosticsSnapshot | null = null;
+    private statusAnchorHandler: StatusAnchorHandler | null = null;
 
     constructor(guildId: string, bot: Client) {
         this.guildId = guildId;
         this.bot = bot;
         this.settings = getGuildSettings(guildId);
         this.consumerLabel = `analyze:${guildId}`;
+    }
+
+    setStatusAnchorHandler(handler: StatusAnchorHandler | null): void {
+        this.statusAnchorHandler = handler;
     }
 
     /**
@@ -436,6 +443,9 @@ export class GuildSession {
                 };
 
                 const starterMsg = await this.targetTextChannel.send({ embeds: [embed] });
+                if (this.statusAnchorHandler) {
+                    await this.statusAnchorHandler(this.guildId, starterMsg);
+                }
                 if (!isFinal) {
                     this.currentStatus = this.isRecording ? '録音中' : '停止中';
                     this.currentTaskLabel = this.isRecording
@@ -580,6 +590,7 @@ export class GuildSession {
 export class SessionManager {
     private bot: Client;
     private sessions: Map<string, GuildSession> = new Map();
+    private statusAnchorHandler: StatusAnchorHandler | null = null;
 
     constructor(bot: Client) {
         this.bot = bot;
@@ -587,7 +598,9 @@ export class SessionManager {
 
     getSession(guildId: string): GuildSession {
         if (!this.sessions.has(guildId)) {
-            this.sessions.set(guildId, new GuildSession(guildId, this.bot));
+            const session = new GuildSession(guildId, this.bot);
+            session.setStatusAnchorHandler(this.statusAnchorHandler);
+            this.sessions.set(guildId, session);
         }
         return this.sessions.get(guildId)!;
     }
@@ -598,6 +611,13 @@ export class SessionManager {
 
     listSessionGuildIds(): string[] {
         return Array.from(this.sessions.keys());
+    }
+
+    setStatusAnchorHandler(handler: StatusAnchorHandler | null): void {
+        this.statusAnchorHandler = handler;
+        for (const session of this.sessions.values()) {
+            session.setStatusAnchorHandler(handler);
+        }
     }
 
     async cleanupSession(

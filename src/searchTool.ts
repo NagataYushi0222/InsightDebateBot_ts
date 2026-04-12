@@ -11,6 +11,7 @@ const SEARCH_REQUEST_HEADERS = {
 
 const SEARCH_RESULT_SCAN_LIMIT = 12;
 const URL_VALIDATION_TIMEOUT_MS = 8_000;
+const SEARCH_FALLBACK_QUERY_LIMIT = 3;
 const SOFT_404_PATTERNS = [
     /404/i,
     /page not found/i,
@@ -42,6 +43,40 @@ function unwrapDuckDuckGoUrl(rawUrl: string): string {
     }
 
     return decodeHtml(rawUrl);
+}
+
+function sanitizeFallbackToken(token: string): string {
+    return token
+        .replace(/[「」『』（）()【】\[\],.!?！？。、:：;；"'`]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function buildFallbackQueries(query: string): string[] {
+    const normalized = query
+        .replace(/確認内容[:：]?/g, ' ')
+        .replace(/確認結果[:：]?/g, ' ')
+        .replace(/参照した参考番号[:：]?/g, ' ')
+        .replace(/ニュースはあるか|関連するニュース|確認してください|調べて|について|ことについて|可能性がある/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    const quotedTokens = Array.from(normalized.matchAll(/[「『"]([^」』"]{2,30})[」』"]/g))
+        .map((match) => sanitizeFallbackToken(match[1] || ''))
+        .filter(Boolean);
+    const splitTokens = normalized
+        .split(/[\s,，、/・]+/)
+        .map(sanitizeFallbackToken)
+        .filter((token) => token.length >= 2);
+    const uniqueTokens = Array.from(new Set([...quotedTokens, ...splitTokens]));
+    const combined = uniqueTokens.slice(0, 4).join(' ').trim();
+    const broad = uniqueTokens.slice(0, 2).join(' ').trim();
+
+    return Array.from(new Set([
+        combined,
+        broad,
+        ...uniqueTokens.slice(0, SEARCH_FALLBACK_QUERY_LIMIT),
+    ])).filter((candidate) => candidate.length >= 2 && candidate !== query);
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
@@ -105,8 +140,7 @@ async function validateSearchResultUrl(rawUrl: string): Promise<string | null> {
     }
 }
 
-export async function searchWeb(query: string, limit: number = 5): Promise<WebSearchResult[]> {
-    const safeLimit = Math.max(1, Math.min(limit, 5));
+async function fetchDuckDuckGoHtml(query: string): Promise<string> {
     const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
     const response = await fetchWithTimeout(url, {
         headers: SEARCH_REQUEST_HEADERS,
@@ -116,7 +150,10 @@ export async function searchWeb(query: string, limit: number = 5): Promise<WebSe
         throw new Error(`Search request failed with status ${response.status}`);
     }
 
-    const html = await response.text();
+    return response.text();
+}
+
+function parseDuckDuckGoResults(html: string): WebSearchResult[] {
     const rawResults: WebSearchResult[] = [];
     const anchorRegex = /<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
 
@@ -142,11 +179,15 @@ export async function searchWeb(query: string, limit: number = 5): Promise<WebSe
         });
     }
 
+    return rawResults;
+}
+
+async function collectValidatedResults(rawResults: WebSearchResult[], limit: number): Promise<WebSearchResult[]> {
     const results: WebSearchResult[] = [];
     const seenResolvedUrls = new Set<string>();
 
     for (const result of rawResults) {
-        if (results.length >= safeLimit) {
+        if (results.length >= limit) {
             break;
         }
 
@@ -164,4 +205,23 @@ export async function searchWeb(query: string, limit: number = 5): Promise<WebSe
     }
 
     return results;
+}
+
+export async function searchWeb(query: string, limit: number = 5): Promise<WebSearchResult[]> {
+    const safeLimit = Math.max(1, Math.min(limit, 5));
+    const attemptedQueries = [query, ...buildFallbackQueries(query)];
+
+    for (const attemptQuery of attemptedQueries) {
+        const html = await fetchDuckDuckGoHtml(attemptQuery);
+        const rawResults = parseDuckDuckGoResults(html);
+        const results = await collectValidatedResults(rawResults, safeLimit);
+        if (results.length > 0) {
+            if (attemptQuery !== query) {
+                console.log(`[Web Search] Fallback query used: "${attemptQuery}" (original: "${query}")`);
+            }
+            return results;
+        }
+    }
+
+    return [];
 }

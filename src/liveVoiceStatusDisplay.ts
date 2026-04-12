@@ -10,7 +10,8 @@ const MAX_INLINE_TEXT_LENGTH = 80;
 const MAX_SPEAKER_LINES = 3;
 
 interface TrackedStatusMessage {
-    message: Message;
+    anchorMessage: Message;
+    monitorMessage: Message | null;
     lastContent: string;
     refreshChain: Promise<void>;
 }
@@ -117,7 +118,7 @@ export class LiveVoiceStatusDisplay {
 
         this.updateTimer = setInterval(() => {
             for (const guildId of this.trackedMessages.keys()) {
-                this.refreshGuild(guildId);
+                void this.refreshGuild(guildId);
             }
         }, STATUS_UPDATE_INTERVAL_MS);
         this.updateTimer.unref?.();
@@ -135,20 +136,53 @@ export class LiveVoiceStatusDisplay {
     /**
      * これ以降の VC 状態表示に使うメッセージを登録する。
      *
-     * slash command の開始・停止時に bot が返したメッセージをここへ渡しておくと、
-     * 以後はその同じメッセージだけを edit し続ける。
-     * これにより、監視メッセージを増やしすぎず「最後に出した状況メッセージ」を育てる運用にできる。
+     * slash command の開始・停止時や自動分析レポートの投稿後に、その「基準メッセージ」をここへ渡しておく。
+     * すると、その直下に専用の VC 稼働モニターを 1 件だけ作り、以後はその monitor message を edit し続ける。
+     *
+     * もし新しい基準メッセージが来たら、古い monitor message は削除してから作り直す。
+     * これにより、チャット欄には常に「最新の bot メッセージ + その直下のモニター」だけが残り、
+     * 監視表示が上の方へ埋もれたり、無駄に増殖したりしないようにしている。
      */
-    bindMessage(guildId: string, message: Message): void {
+    async bindMessage(guildId: string, anchorMessage: Message): Promise<void> {
         const existing = this.trackedMessages.get(guildId);
-        this.trackedMessages.set(guildId, {
-            message,
-            lastContent: existing?.lastContent || '',
-            refreshChain: existing?.refreshChain || Promise.resolve(),
-        });
+        const previousAnchorId = existing?.anchorMessage.id || null;
+        const tracked: TrackedStatusMessage = existing || {
+            anchorMessage,
+            monitorMessage: null,
+            lastContent: '',
+            refreshChain: Promise.resolve(),
+        };
 
+        tracked.anchorMessage = anchorMessage;
+        this.trackedMessages.set(guildId, tracked);
         this.start();
-        this.refreshGuild(guildId);
+
+        tracked.refreshChain = tracked.refreshChain
+            .then(async () => {
+                const anchorChanged = tracked.monitorMessage === null
+                    || previousAnchorId !== anchorMessage.id;
+
+                if (!anchorChanged) {
+                    return;
+                }
+
+                if (tracked.monitorMessage) {
+                    await tracked.monitorMessage.delete().catch(() => undefined);
+                }
+
+                tracked.monitorMessage = await anchorMessage.channel.send({
+                    content: '📡 **VC稼働モニター**\n更新準備中...',
+                });
+                tracked.lastContent = '';
+            })
+            .then(async () => {
+                await this.refreshGuild(guildId);
+            })
+            .catch((error) => {
+                console.error(`[Live Status] Failed to bind monitor message for guild ${guildId}:`, error);
+            });
+
+        await tracked.refreshChain;
     }
 
     /**
@@ -157,44 +191,40 @@ export class LiveVoiceStatusDisplay {
      * 状態変化が大きい start / stop 直後に呼ぶと、10 秒待たずに画面へ反映できる。
      */
     refreshNow(guildId: string): void {
-        this.refreshGuild(guildId);
+        void this.refreshGuild(guildId);
     }
 
-    private refreshGuild(guildId: string): void {
+    private async refreshGuild(guildId: string): Promise<void> {
         const tracked = this.trackedMessages.get(guildId);
-        if (!tracked) {
+        if (!tracked || !tracked.monitorMessage) {
             return;
         }
 
-        tracked.refreshChain = tracked.refreshChain
-            .then(async () => {
-                const payload = this.buildContent(guildId);
-                const nextContent = payload.content;
+        tracked.refreshChain = tracked.refreshChain.then(async () => {
+            const payload = this.buildContent(guildId);
+            const nextContent = payload.content;
 
-                if (tracked.lastContent === nextContent) {
-                    if (!payload.keepTracking) {
-                        this.trackedMessages.delete(guildId);
-                        this.stopIfUnused();
-                    }
-                    return;
-                }
-
+            if (tracked.lastContent !== nextContent) {
                 try {
-                    await tracked.message.edit({ content: nextContent });
+                    await tracked.monitorMessage?.edit({ content: nextContent });
                     tracked.lastContent = nextContent;
-                    if (!payload.keepTracking) {
-                        this.trackedMessages.delete(guildId);
-                        this.stopIfUnused();
-                    }
                 } catch (error) {
                     console.error(`[Live Status] Failed to edit status message for guild ${guildId}:`, error);
                     this.trackedMessages.delete(guildId);
                     this.stopIfUnused();
+                    return;
                 }
-            })
-            .catch((error) => {
-                console.error(`[Live Status] Failed to refresh guild ${guildId}:`, error);
-            });
+            }
+
+            if (!payload.keepTracking) {
+                this.trackedMessages.delete(guildId);
+                this.stopIfUnused();
+            }
+        }).catch((error) => {
+            console.error(`[Live Status] Failed to refresh guild ${guildId}:`, error);
+        });
+
+        await tracked.refreshChain;
     }
 
     private buildContent(guildId: string): RenderedStatusPayload {

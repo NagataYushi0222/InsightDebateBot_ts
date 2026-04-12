@@ -3,6 +3,7 @@ import {
     Client,
     Events,
     GatewayIntentBits,
+    Message,
     MessageFlags,
     REST,
     Routes,
@@ -47,6 +48,7 @@ const vcArticleManager = new VcArticleSessionManager(client);
 const sharedVoiceCoordinator = new SharedVoiceCoordinator(client, sessionManager, vcArticleManager);
 const runtimeMonitor = new RuntimeMonitor(client, sessionManager, vcArticleManager, sharedVoiceCoordinator);
 const liveVoiceStatusDisplay = new LiveVoiceStatusDisplay(client, sessionManager, vcArticleManager);
+sessionManager.setStatusAnchorHandler((guildId, message) => liveVoiceStatusDisplay.bindMessage(guildId, message));
 
 const commands = [
     new SlashCommandBuilder()
@@ -412,7 +414,7 @@ async function handleAnalyzeStart(
             userKey,
             voiceChannel.name
         );
-        liveVoiceStatusDisplay.bindMessage(guildId, initialMessage);
+        await liveVoiceStatusDisplay.bindMessage(guildId, initialMessage);
     } catch (error) {
         if (session.hasActiveConnection() || session.isBusy()) {
             await session.stopRecording(true, sharedVoiceCoordinator.shouldDestroyAnalyzeConnection(guildId));
@@ -444,7 +446,7 @@ async function handleAnalyzeStop(
             sharedVoiceCoordinator.shouldDestroyAnalyzeConnection(guildId)
         );
         const message = await interaction.followUp('✅ 分析を終了しました。お疲れ様でした！');
-        liveVoiceStatusDisplay.bindMessage(guildId, message);
+        await liveVoiceStatusDisplay.bindMessage(guildId, message);
         return;
     }
 
@@ -471,7 +473,7 @@ async function handleAnalyzeStopFinal(
 
     if (session.hasActiveConnection()) {
         const progressMessage = await interaction.followUp('🔄 最終レポートを作成して終了します。しばらくお待ちください...');
-        liveVoiceStatusDisplay.bindMessage(guildId, progressMessage);
+        await liveVoiceStatusDisplay.bindMessage(guildId, progressMessage);
         runtimeMonitor.logSessionCleanup('manual_analyze_stop_final', guildId);
         await sessionManager.cleanupSession(
             guildId,
@@ -479,7 +481,7 @@ async function handleAnalyzeStopFinal(
             sharedVoiceCoordinator.shouldDestroyAnalyzeConnection(guildId)
         );
         const doneMessage = await interaction.followUp('✅ 最終レポートを作成し、分析を終了しました。お疲れ様でした！');
-        liveVoiceStatusDisplay.bindMessage(guildId, doneMessage);
+        await liveVoiceStatusDisplay.bindMessage(guildId, doneMessage);
         return;
     }
 
@@ -563,7 +565,7 @@ async function handleArticleStart(
         '録音終了後に `/article_stop` を実行すると、記事候補トピックを抽出します。\n' +
         '同じテキストチャンネルの投稿は、記事化の参考ログとして取り込みます。'
     );
-    liveVoiceStatusDisplay.bindMessage(guildId, initialMessage);
+    await liveVoiceStatusDisplay.bindMessage(guildId, initialMessage);
 }
 
 async function handleArticleStop(
@@ -589,13 +591,20 @@ async function handleArticleStop(
 
     await interaction.deferReply();
     const progressMessage = await interaction.followUp('🔄 録音を停止しました。VC から退出し、記事候補トピックを抽出しています...');
-    liveVoiceStatusDisplay.bindMessage(guildId, progressMessage);
+    await liveVoiceStatusDisplay.bindMessage(guildId, progressMessage);
     runtimeMonitor.logSessionCleanup('manual_article_stop', guildId);
     const topicResult = await articleSession.stopAndExtractTopics(
         sharedVoiceCoordinator.shouldDestroyArticleConnection(guildId)
     );
-    liveVoiceStatusDisplay.refreshNow(guildId);
-    await followUpInChunks(interaction, formatTopicsMessage(topicResult, articleSession.getActiveArchiveId()));
+    const lastMessage = await followUpInChunks(
+        interaction,
+        formatTopicsMessage(topicResult, articleSession.getActiveArchiveId()),
+    );
+    if (lastMessage) {
+        await liveVoiceStatusDisplay.bindMessage(guildId, lastMessage);
+    } else {
+        liveVoiceStatusDisplay.refreshNow(guildId);
+    }
 }
 
 async function handleArticleTopics(
@@ -648,9 +657,16 @@ async function handleArticleLoad(
     }
 
     await interaction.deferReply();
-    await interaction.followUp(`📂 保存済み音声 ${archiveId} を読み込み、保存済み記事候補を確認しています...`);
+    const progressMessage = await interaction.followUp(`📂 保存済み音声 ${archiveId} を読み込み、保存済み記事候補を確認しています...`);
+    await liveVoiceStatusDisplay.bindMessage(guildId, progressMessage);
     const topicResult = await articleSession.loadArchiveAndExtractTopics(archiveId, userKey);
-    await followUpInChunks(interaction, formatTopicsMessage(topicResult, articleSession.getActiveArchiveId()));
+    const lastMessage = await followUpInChunks(
+        interaction,
+        formatTopicsMessage(topicResult, articleSession.getActiveArchiveId()),
+    );
+    if (lastMessage) {
+        await liveVoiceStatusDisplay.bindMessage(guildId, lastMessage);
+    }
 }
 
 async function handleArticleWrite(
@@ -669,9 +685,13 @@ async function handleArticleWrite(
     }
 
     await interaction.deferReply();
-    await interaction.followUp(`📝 トピック ${topicId} から記事を生成しています...`);
+    const progressMessage = await interaction.followUp(`📝 トピック ${topicId} から記事を生成しています...`);
+    await liveVoiceStatusDisplay.bindMessage(guildId, progressMessage);
     const article = await articleSession.generateArticle(topicId);
-    await followUpInChunks(interaction, article);
+    const lastMessage = await followUpInChunks(interaction, article);
+    if (lastMessage) {
+        await liveVoiceStatusDisplay.bindMessage(guildId, lastMessage);
+    }
 }
 
 async function handleArticleDiscard(
@@ -966,10 +986,12 @@ function splitForDiscord(content: string, maxLength: number = 1900): string[] {
 async function followUpInChunks(
     interaction: ChatInputCommandInteraction,
     content: string
-): Promise<void> {
+): Promise<Message | null> {
+    let lastMessage: Message | null = null;
     for (const chunk of splitForDiscord(content)) {
-        await interaction.followUp(chunk);
+        lastMessage = await interaction.followUp(chunk);
     }
+    return lastMessage;
 }
 
 async function replyInChunks(

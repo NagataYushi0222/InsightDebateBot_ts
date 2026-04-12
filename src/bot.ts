@@ -35,6 +35,7 @@ const client = new Client({
 
 const sessionManager = new SessionManager(client);
 const liveVoiceStatusDisplay = new LiveVoiceStatusDisplay(client, sessionManager);
+sessionManager.setStatusAnchorHandler((guildId, message) => liveVoiceStatusDisplay.bindMessage(guildId, message));
 
 function seedVoiceParticipants(connection: VoiceConnection, voiceChannel: VoiceBasedChannel): void {
     if (connection.state.status !== VoiceConnectionStatus.Ready) {
@@ -358,7 +359,7 @@ async function handleAnalyzeStart(
             userKey,
             voiceChannel.name
         );
-        liveVoiceStatusDisplay.bindMessage(guildId, initialMessage);
+        await liveVoiceStatusDisplay.bindMessage(guildId, initialMessage);
     } catch (e) {
         if (session.hasActiveConnection() || session.isBusy()) {
             await session.stopRecording(true);
@@ -385,7 +386,7 @@ async function handleAnalyzeStop(
     if (session.hasActiveConnection()) {
         await sessionManager.cleanupSession(guildId, true);
         const message = await interaction.followUp('✅ 分析を終了しました。お疲れ様でした！');
-        liveVoiceStatusDisplay.bindMessage(guildId, message);
+        await liveVoiceStatusDisplay.bindMessage(guildId, message);
     } else {
         await interaction.followUp({
             content: '分析は実行されていません。',
@@ -411,10 +412,10 @@ async function handleAnalyzeStopFinal(
 
     if (session.hasActiveConnection()) {
         const progressMessage = await interaction.followUp('🔄 最終レポートを作成して終了します。しばらくお待ちください...');
-        liveVoiceStatusDisplay.bindMessage(guildId, progressMessage);
+        await liveVoiceStatusDisplay.bindMessage(guildId, progressMessage);
         await sessionManager.cleanupSession(guildId, false);
         const doneMessage = await interaction.followUp('✅ 最終レポートを作成し、分析を終了しました。お疲れ様でした！');
-        liveVoiceStatusDisplay.bindMessage(guildId, doneMessage);
+        await liveVoiceStatusDisplay.bindMessage(guildId, doneMessage);
     } else {
         await interaction.followUp({
             content: '分析は実行されていません。',

@@ -43,20 +43,28 @@ function stripReferenceSection(reportText: string): string {
 }
 
 function buildReferenceSection(
-    references: SearchReferenceEntry[],
+    citedReferences: SearchReferenceEntry[],
+    consultedReferences: SearchReferenceEntry[],
     allReferenceCount: number,
 ): string {
-    if (references.length === 0) {
+    if (citedReferences.length > 0) {
+        return [
+            '【参考URL】',
+            ...citedReferences.map((reference) => `[${reference.refId}] ${reference.title}\n${reference.url}`),
+        ].join('\n');
+    }
+
+    if (consultedReferences.length === 0) {
         if (allReferenceCount === 0) {
             return '【参考URL】\n- 検索結果から有効なURLを取得できませんでした。';
         }
-
-        return '【参考URL】\n- 本文中で参考番号が引用されなかったため、実際に参照したURLを特定できませんでした。';
+        return '【参考URL】\n- 検索は実行されましたが、有効な参考URLを組み立てられませんでした。';
     }
 
     return [
         '【参考URL】',
-        ...references.map((reference) => `[${reference.refId}] ${reference.title}\n${reference.url}`),
+        '- 本文中で参考番号の明示がなかったため、以下には今回の検索で実際に取得してモデルへ渡したURLを掲載します。',
+        ...consultedReferences.map((reference) => `[${reference.refId}] ${reference.title}\n${reference.url}`),
     ].join('\n');
 }
 
@@ -137,6 +145,43 @@ function ensureFactCheckSection(
     return `${reportText.trimEnd()}\n\n${fallbackSection}`;
 }
 
+function addFactCheckReferenceHint(
+    reportText: string,
+    mode: string,
+    references: SearchReferenceEntry[],
+): string {
+    if (references.length === 0) {
+        return reportText;
+    }
+
+    const sectionTitle = mode === 'summary'
+        ? '【ファクトチェック】'
+        : '【争点と矛盾・ファクトチェック】';
+    const sectionStart = reportText.indexOf(sectionTitle);
+    if (sectionStart === -1) {
+        return reportText;
+    }
+
+    const nextSectionIndex = reportText.indexOf('\n【', sectionStart + sectionTitle.length);
+    const sectionEnd = nextSectionIndex === -1 ? reportText.length : nextSectionIndex;
+    const sectionBody = reportText.slice(sectionStart, sectionEnd);
+    if (/\[(参考\d+)\]/.test(sectionBody)) {
+        return reportText;
+    }
+
+    const hintedRefs = references
+        .slice(0, 3)
+        .map((reference) => `[${reference.refId}]`)
+        .join(', ');
+    const hintLines = [
+        '- 補足:',
+        `  - モデル本文では参照番号が明示されませんでしたが、今回の検索で取得してモデルへ渡した候補は ${hintedRefs} です。`,
+        '  - 対応するURLは末尾の【参考URL】を参照してください。',
+    ].join('\n');
+
+    return `${reportText.slice(0, sectionEnd).trimEnd()}\n${hintLines}${reportText.slice(sectionEnd)}`;
+}
+
 function appendReferenceUrls(reportText: string, mode: string, searchTrace: SearchTrace[]): string {
     const references = buildSearchReferenceEntries(searchTrace);
     const factCheckedReport = ensureFactCheckSection(
@@ -144,9 +189,15 @@ function appendReferenceUrls(reportText: string, mode: string, searchTrace: Sear
         mode,
         references,
     );
-    const usedReferences = selectUsedReferences(factCheckedReport, references);
-    const referenceSection = buildReferenceSection(usedReferences, references.length);
-    return `${factCheckedReport}\n\n${referenceSection}`;
+    const hintedReport = addFactCheckReferenceHint(factCheckedReport, mode, references);
+    const usedReferences = selectUsedReferences(hintedReport, references);
+    const fallbackConsultedReferences = usedReferences.length > 0 ? [] : references.slice(0, 5);
+    const referenceSection = buildReferenceSection(
+        usedReferences,
+        fallbackConsultedReferences,
+        references.length,
+    );
+    return `${hintedReport}\n\n${referenceSection}`;
 }
 
 /**
