@@ -256,6 +256,25 @@ async function collectValidatedResults(rawResults: WebSearchResult[], limit: num
         });
     }
 
+    if (results.length === 0 && rawResults.length > 0) {
+        const fallbackResults: WebSearchResult[] = [];
+        const seenRawUrls = new Set<string>();
+
+        for (const result of rawResults) {
+            if (fallbackResults.length >= limit) {
+                break;
+            }
+            if (seenRawUrls.has(result.url)) {
+                continue;
+            }
+            seenRawUrls.add(result.url);
+            fallbackResults.push(result);
+        }
+
+        console.log('[Web Search] URL validation rejected every result, using raw search result URLs instead.');
+        return fallbackResults;
+    }
+
     return results;
 }
 
