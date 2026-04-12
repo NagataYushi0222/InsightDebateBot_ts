@@ -1,5 +1,4 @@
 import {
-    createPartFromFunctionCall,
     createPartFromFunctionResponse,
     FunctionCallingConfigMode,
     GoogleGenAI,
@@ -112,12 +111,13 @@ export async function generateContentWithWebSearch(
             };
         }
 
-        contents.push({
-            role: 'model',
-            parts: functionCalls.map((call: any) =>
-                createPartFromFunctionCall(call.name, (call.args || {}) as Record<string, unknown>)
-            ),
-        });
+        const modelContent = response.candidates?.[0]?.content;
+        if (!modelContent?.parts?.length) {
+            throw new Error('モデルの function call content を履歴に追加できませんでした。');
+        }
+
+        // Preserve the full model content exactly as returned so Gemini 3 thought signatures survive.
+        contents.push(modelContent);
 
         const functionResponseParts = [];
         for (const call of functionCalls) {
