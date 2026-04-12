@@ -8,14 +8,7 @@ import {
     Routes,
     SlashCommandBuilder,
     TextChannel,
-    VoiceBasedChannel,
 } from 'discord.js';
-import {
-    entersState,
-    joinVoiceChannel,
-    VoiceConnection,
-    VoiceConnectionStatus,
-} from '@ovencord/voice';
 import {
     DEFAULT_MODEL,
     DISCORD_TOKEN,
@@ -34,6 +27,7 @@ import {
 import { SessionManager } from './sessionManager';
 import { VcArticleSessionManager } from './vcArticle/sessionManager';
 import { ArchivedSessionSummary, listArchivedSessions } from './vcArticle/storage';
+import { SharedVoiceCoordinator } from './sharedVoiceCoordinator';
 
 initDb();
 
@@ -48,33 +42,7 @@ const client = new Client({
 
 const sessionManager = new SessionManager(client);
 const vcArticleManager = new VcArticleSessionManager(client);
-
-function seedVoiceParticipants(connection: VoiceConnection, voiceChannel: VoiceBasedChannel): void {
-    if (connection.state.status !== VoiceConnectionStatus.Ready) {
-        return;
-    }
-
-    const networkingState = connection.state.networking.state as {
-        connectionData?: {
-            connectedClients?: Set<string>;
-        };
-    };
-    const connectedClients = networkingState.connectionData?.connectedClients;
-    if (!connectedClients) {
-        return;
-    }
-
-    for (const [memberId, member] of voiceChannel.members) {
-        if (member.user.bot) {
-            continue;
-        }
-        connectedClients.add(memberId);
-    }
-
-    console.log(
-        `[Voice Seed] Seeded ${connectedClients.size} connected client(s) for channel ${voiceChannel.id}`
-    );
-}
+const sharedVoiceCoordinator = new SharedVoiceCoordinator(client, sessionManager, vcArticleManager);
 
 const commands = [
     new SlashCommandBuilder()
@@ -320,43 +288,50 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
     if (!oldState.channelId || oldState.channelId === newState.channelId) return;
 
     const guildId = oldState.guild.id;
-
     const analyzeSession = sessionManager.getSession(guildId);
-    if (analyzeSession.hasActiveConnection() && analyzeSession.isRecording) {
-        const botChannelId = analyzeSession.voiceConnection!.joinConfig.channelId;
-        if (oldState.channelId === botChannelId) {
-            const channel = oldState.channel;
-            if (channel) {
-                const nonBotMembers = channel.members.filter((member) => !member.user.bot);
-                if (nonBotMembers.size === 0) {
-                    if (analyzeSession.targetTextChannel) {
-                        await analyzeSession.targetTextChannel.send('👋 全員がボイスチャンネルから退出したため、自動的に分析を終了します。');
-                    }
-                    await sessionManager.cleanupSession(guildId, false);
-                }
-            }
-        }
+    const articleSession = vcArticleManager.getSession(guildId);
+    const { analyzeActive, articleActive, sharedConnection } =
+        sharedVoiceCoordinator.getChannelActivityState(guildId, oldState.channelId);
+
+    if (!analyzeActive && !articleActive) {
+        return;
     }
 
-    const articleSession = vcArticleManager.getSession(guildId);
-    if (articleSession.hasActiveConnection() && articleSession.isRecording) {
-        const botChannelId = articleSession.voiceConnection!.joinConfig.channelId;
-        if (oldState.channelId === botChannelId) {
-            const channel = oldState.channel;
-            if (channel) {
-                const nonBotMembers = channel.members.filter((member) => !member.user.bot);
-                if (nonBotMembers.size === 0) {
-                    const textChannel = articleSession.targetTextChannel;
-                    if (textChannel) {
-                        await textChannel.send('👋 全員が退出したため、録音を停止して記事候補を抽出します。');
-                        const topicResult = await articleSession.stopAndExtractTopics();
-                        await sendChannelMessageInChunks(textChannel, formatTopicsMessage(topicResult));
-                    } else {
-                        await vcArticleManager.cleanupSession(guildId);
-                    }
-                }
-            }
-        }
+    const channel = oldState.channel;
+    if (!channel) {
+        return;
+    }
+
+    const nonBotMembers = channel.members.filter((member) => !member.user.bot);
+    if (nonBotMembers.size > 0) {
+        return;
+    }
+
+    if (analyzeActive && analyzeSession.targetTextChannel) {
+        await analyzeSession.targetTextChannel.send('👋 全員がボイスチャンネルから退出したため、自動的に分析を終了します。');
+    }
+
+    if (articleActive && articleSession.targetTextChannel) {
+        await articleSession.targetTextChannel.send('👋 全員が退出したため、録音を停止して記事候補を抽出します。');
+    }
+
+    if (analyzeActive) {
+        await sessionManager.cleanupSession(guildId, false, !sharedConnection);
+    }
+
+    if (!articleActive) {
+        return;
+    }
+
+    const articleTextChannel = articleSession.targetTextChannel;
+    if (articleTextChannel) {
+        const topicResult = await articleSession.stopAndExtractTopics(true);
+        await sendChannelMessageInChunks(
+            articleTextChannel,
+            formatTopicsMessage(topicResult, articleSession.getActiveArchiveId())
+        );
+    } else {
+        await vcArticleManager.cleanupSession(guildId, true);
     }
 });
 
@@ -368,14 +343,6 @@ async function handleAnalyzeStart(
     if (!userKey) {
         await interaction.reply({
             content: '❌ **APIキーが設定されていません**。\n`/settings set_apikey [あなたのキー]` で一度だけ登録してください。',
-            flags: MessageFlags.Ephemeral,
-        });
-        return;
-    }
-
-    if (vcArticleManager.getSession(guildId).hasActiveConnection()) {
-        await interaction.reply({
-            content: '記事化用の録音が実行中です。先に `/article_stop` または `/article_discard` を実行してください。',
             flags: MessageFlags.Ephemeral,
         });
         return;
@@ -401,35 +368,11 @@ async function handleAnalyzeStart(
     }
 
     try {
-        const connection = joinVoiceChannel({
-            channelId: voiceChannel.id,
+        const { connection, reused } = await sharedVoiceCoordinator.ensureVoiceConnectionForChannel(
             guildId,
-            adapterCreator: interaction.guild!.voiceAdapterCreator,
-            selfDeaf: false,
-            debug: true,
-        });
-
-        connection.on('stateChange', (oldState, newState) => {
-            console.log(`[Voice] ${oldState.status} -> ${newState.status}`);
-            if (newState.status === VoiceConnectionStatus.Disconnected) {
-                entersState(connection, VoiceConnectionStatus.Connecting, 5_000)
-                    .catch(() => connection.destroy());
-            }
-            if (newState.status === VoiceConnectionStatus.Destroyed) {
-                sessionManager.cleanupDestroyedConnection(guildId, connection);
-            }
-            if (newState.status === VoiceConnectionStatus.Ready) {
-                seedVoiceParticipants(connection, voiceChannel);
-            }
-        });
-        connection.on('error', (error) => {
-            console.error('[Voice] Connection Error:', error);
-        });
-        connection.on('debug', (message) => {
-            console.log(`[Voice Debug] ${message}`);
-        });
-
-        await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+            voiceChannel,
+            interaction.guild!.voiceAdapterCreator
+        );
 
         const settings = getGuildSettings(guildId);
         const mode = settings.analysis_mode || 'debate';
@@ -440,6 +383,7 @@ async function handleAnalyzeStart(
             `👥｜**${voiceChannel.name}** の分析を開始しました。\n` +
             'プライバシー保護のため、録音・分析が行われることを参加者に周知してください。\n' +
             `\`[設定] 間隔: ${intervalMins}分 / モード: ${mode}\`\n\n` +
+            `${reused ? '🔗 同じVCで動作中の接続を共有して開始しました。\n' : ''}` +
             `⏳ 次のレポート出力まで: 約 ${intervalMins}分`
         );
 
@@ -452,7 +396,7 @@ async function handleAnalyzeStart(
         );
     } catch (error) {
         if (session.hasActiveConnection()) {
-            await session.stopRecording(true);
+            await session.stopRecording(true, sharedVoiceCoordinator.shouldDestroyAnalyzeConnection(guildId));
         }
         await interaction.followUp(`エラーが発生しました: ${error}`);
     }
@@ -466,7 +410,11 @@ async function handleAnalyzeStop(
     const session = sessionManager.getSession(guildId);
 
     if (session.hasActiveConnection()) {
-        await sessionManager.cleanupSession(guildId, true);
+        await sessionManager.cleanupSession(
+            guildId,
+            true,
+            sharedVoiceCoordinator.shouldDestroyAnalyzeConnection(guildId)
+        );
         await interaction.followUp('✅ 分析を終了しました。お疲れ様でした！');
         return;
     }
@@ -486,7 +434,11 @@ async function handleAnalyzeStopFinal(
 
     if (session.hasActiveConnection()) {
         await interaction.followUp('🔄 最終レポートを作成して終了します。しばらくお待ちください...');
-        await sessionManager.cleanupSession(guildId, false);
+        await sessionManager.cleanupSession(
+            guildId,
+            false,
+            sharedVoiceCoordinator.shouldDestroyAnalyzeConnection(guildId)
+        );
         await interaction.followUp('✅ 最終レポートを作成し、分析を終了しました。お疲れ様でした！');
         return;
     }
@@ -528,14 +480,6 @@ async function handleArticleStart(
         return;
     }
 
-    if (sessionManager.getSession(guildId).hasActiveConnection()) {
-        await interaction.reply({
-            content: '通常の分析が実行中です。先に `/analyze_stop` または `/analyze_stop_final` を実行してください。',
-            flags: MessageFlags.Ephemeral,
-        });
-        return;
-    }
-
     const articleSession = vcArticleManager.getSession(guildId);
     if (articleSession.hasActiveConnection()) {
         await interaction.reply({
@@ -557,29 +501,11 @@ async function handleArticleStart(
 
     await interaction.deferReply();
 
-    const connection = joinVoiceChannel({
-        channelId: voiceChannel.id,
+    const { connection, reused } = await sharedVoiceCoordinator.ensureVoiceConnectionForChannel(
         guildId,
-        adapterCreator: interaction.guild!.voiceAdapterCreator,
-        selfDeaf: false,
-        debug: true,
-    });
-
-    connection.on('stateChange', (oldState, newState) => {
-        console.log(`[Article Voice] ${oldState.status} -> ${newState.status}`);
-        if (newState.status === VoiceConnectionStatus.Disconnected) {
-            entersState(connection, VoiceConnectionStatus.Connecting, 5_000)
-                .catch(() => connection.destroy());
-        }
-        if (newState.status === VoiceConnectionStatus.Destroyed) {
-            vcArticleManager.cleanupDestroyedConnection(guildId, connection);
-        }
-        if (newState.status === VoiceConnectionStatus.Ready) {
-            seedVoiceParticipants(connection, voiceChannel);
-        }
-    });
-
-    await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+        voiceChannel,
+        interaction.guild!.voiceAdapterCreator
+    );
     await articleSession.startRecording(
         connection,
         interaction.channel as TextChannel,
@@ -591,6 +517,7 @@ async function handleArticleStart(
     await interaction.followUp(
         `📰 **VC記事化モードを開始しました**\n` +
         `対象VC: **${voiceChannel.name}**\n` +
+        `${reused ? '🔗 同じVCで動作中の接続を共有して開始しました。\n' : ''}` +
         '録音終了後に `/article_stop` を実行すると、記事候補トピックを抽出します。\n' +
         '同じテキストチャンネルの投稿は、記事化の参考ログとして取り込みます。'
     );
@@ -611,7 +538,9 @@ async function handleArticleStop(
 
     await interaction.deferReply();
     await interaction.followUp('🔄 録音を停止し、記事候補トピックを抽出しています...');
-    const topicResult = await articleSession.stopAndExtractTopics();
+    const topicResult = await articleSession.stopAndExtractTopics(
+        sharedVoiceCoordinator.shouldDestroyArticleConnection(guildId)
+    );
     await followUpInChunks(interaction, formatTopicsMessage(topicResult, articleSession.getActiveArchiveId()));
 }
 
@@ -650,14 +579,6 @@ async function handleArticleLoad(
     if (!userKey) {
         await interaction.reply({
             content: '❌ APIキーが設定されていません。\n`/settings set_apikey [あなたのキー]` を実行してください。',
-            flags: MessageFlags.Ephemeral,
-        });
-        return;
-    }
-
-    if (sessionManager.getSession(guildId).hasActiveConnection()) {
-        await interaction.reply({
-            content: '通常の分析が実行中です。先に `/analyze_stop` または `/analyze_stop_final` を実行してください。',
             flags: MessageFlags.Ephemeral,
         });
         return;
@@ -703,7 +624,10 @@ async function handleArticleDiscard(
     interaction: ChatInputCommandInteraction,
     guildId: string
 ): Promise<void> {
-    await vcArticleManager.cleanupSession(guildId);
+    await vcArticleManager.cleanupSession(
+        guildId,
+        sharedVoiceCoordinator.shouldDestroyArticleConnection(guildId)
+    );
     await interaction.reply({
         content: '🧹 現在の録音・選択中キャッシュを破棄しました。保存済み音声ファイル自体は残ります。',
         flags: MessageFlags.Ephemeral,

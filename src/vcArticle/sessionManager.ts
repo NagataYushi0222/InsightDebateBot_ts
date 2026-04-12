@@ -1,14 +1,12 @@
 import {
-    AudioReceiveStream,
-    EndBehaviorType,
     VoiceConnection,
     VoiceConnectionStatus,
 } from '@ovencord/voice';
 import { Client, Guild, Message, TextChannel } from 'discord.js';
 import { cleanupFiles, convertToMp3 } from '../audioProcessor';
 import { getGuildSettings } from '../database';
-import { OpusDecoder } from '../opusDecoder';
 import { UserAudioRecorder } from '../recorder';
+import { attachVoiceCaptureConsumer } from '../voiceCaptureHub';
 import { extractArticleTopics, generateArticleFromTopic } from './ai';
 import {
     loadArchivedSession,
@@ -38,8 +36,7 @@ export class VcArticleSession {
 
     private readonly guildId: string;
     private recorder: UserAudioRecorder | null = null;
-    private opusDecoders: Map<string, OpusDecoder> = new Map();
-    private subscribedUsers: Set<string> = new Set();
+    private detachVoiceCapture: (() => void) | null = null;
     private textEntries: TextChatEntry[] = [];
     private userMap: Map<string, string> = new Map();
     private apiKey: string | null = null;
@@ -109,58 +106,19 @@ export class VcArticleSession {
         this.chunkTimer = setInterval(() => {
             void this.enqueueChunkProcessing();
         }, ARTICLE_CHUNK_INTERVAL_MS);
-
-        const receiver = connection.receiver;
-
-        receiver.speaking.on('start', (userId: string) => {
-            if (this.subscribedUsers.has(userId) || !this.recorder) return;
-            this.subscribedUsers.add(userId);
-
-            const opusStream = receiver.subscribe(userId, {
-                end: { behavior: EndBehaviorType.Manual },
-            });
-
-            this.consumeAudioStream(guild, userId, opusStream);
-        });
-    }
-
-    private consumeAudioStream(guild: Guild, userId: string, opusStream: AudioReceiveStream): void {
-        if (!this.opusDecoders.has(userId)) {
-            this.opusDecoders.set(userId, new OpusDecoder());
-        }
-        const decoder = this.opusDecoders.get(userId)!;
-        const reader = opusStream.stream.getReader();
-
-        const member = guild.members.cache.get(userId);
-        if (member && !member.user.bot) {
-            this.userMap.set(userId, member.displayName);
-        }
-
-        const readLoop = async () => {
-            try {
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done || !value) break;
-                    if (!this.isRecording || !this.recorder) continue;
-
-                    try {
-                        const pcmData = decoder.decode(Buffer.from(value));
-                        if (pcmData) {
-                            this.recorder.write(userId, pcmData);
-                        }
-                    } catch {
-                        // ignore packet decode errors
-                    }
+        this.detachFromVoiceCapture();
+        this.detachVoiceCapture = attachVoiceCaptureConsumer(connection, {
+            onSpeakerStart: (userId) => {
+                this.rememberDisplayName(guild, userId);
+            },
+            onAudio: (userId, pcmData) => {
+                if (!this.isRecording || !this.recorder) return;
+                if (!this.userMap.has(userId)) {
+                    this.rememberDisplayName(guild, userId);
                 }
-            } catch (error) {
-                console.error(`VC article audio stream error for ${userId}:`, error);
-            } finally {
-                this.subscribedUsers.delete(userId);
-                this.opusDecoders.delete(userId);
-            }
-        };
-
-        void readLoop();
+                this.recorder.write(userId, pcmData);
+            },
+        });
     }
 
     recordTextMessage(message: Message): void {
@@ -176,17 +134,18 @@ export class VcArticleSession {
         });
     }
 
-    async stopAndExtractTopics(): Promise<TopicExtractionResult> {
+    async stopAndExtractTopics(destroyConnection: boolean = true): Promise<TopicExtractionResult> {
         if (!this.recorder || !this.isRecording) {
             throw new Error('記事化用の録音セッションは開始されていません。');
         }
 
         this.isRecording = false;
+        this.detachFromVoiceCapture();
         this.clearChunkTimer();
         await this.enqueueChunkProcessing();
 
         if (this.pendingAudioClips.length === 0) {
-            this.disposeVoiceConnection();
+            this.releaseVoiceConnection(destroyConnection);
             this.resetLiveResources();
             return { sessionSummary: '録音データがありませんでした。', topics: [] };
         }
@@ -223,7 +182,7 @@ export class VcArticleSession {
             topicResult,
         };
 
-        this.disposeVoiceConnection();
+        this.releaseVoiceConnection(destroyConnection);
         this.resetLiveResources();
 
         return topicResult;
@@ -294,11 +253,12 @@ export class VcArticleSession {
         return topicResult;
     }
 
-    async discard(): Promise<void> {
+    async discard(destroyConnection: boolean = true): Promise<void> {
         this.isRecording = false;
+        this.detachFromVoiceCapture();
         this.clearChunkTimer();
         await this.chunkProcessing.catch(() => undefined);
-        this.disposeVoiceConnection();
+        this.releaseVoiceConnection(destroyConnection);
         this.resetLiveResources();
         await this.clearFinalizedArtifacts();
     }
@@ -306,14 +266,15 @@ export class VcArticleSession {
     handleDestroyedConnection(connection: VoiceConnection): boolean {
         if (this.voiceConnection !== connection) return false;
         this.isRecording = false;
+        this.detachFromVoiceCapture();
         this.clearChunkTimer();
         this.voiceConnection = null;
         this.resetLiveResources();
         return true;
     }
 
-    private disposeVoiceConnection(): void {
-        if (this.voiceConnection && this.voiceConnection.state.status !== VoiceConnectionStatus.Destroyed) {
+    private releaseVoiceConnection(destroyConnection: boolean): void {
+        if (destroyConnection && this.voiceConnection && this.voiceConnection.state.status !== VoiceConnectionStatus.Destroyed) {
             this.voiceConnection.destroy();
         }
         this.voiceConnection = null;
@@ -322,8 +283,6 @@ export class VcArticleSession {
     private resetLiveResources(): void {
         cleanupFiles(this.pendingAudioClips.map((clip) => clip.filePath));
         this.recorder = null;
-        this.opusDecoders.clear();
-        this.subscribedUsers.clear();
         this.targetTextChannel = null;
         this.sessionStartedAt = null;
         this.pendingAudioClips = [];
@@ -377,6 +336,31 @@ export class VcArticleSession {
 
         cleanupFiles(cleanupTargets);
     }
+
+    private detachFromVoiceCapture(): void {
+        if (!this.detachVoiceCapture) {
+            return;
+        }
+
+        this.detachVoiceCapture();
+        this.detachVoiceCapture = null;
+    }
+
+    private rememberDisplayName(guild: Guild, userId: string): void {
+        const member = guild.members.cache.get(userId);
+        if (member && !member.user.bot) {
+            this.userMap.set(userId, member.displayName);
+            return;
+        }
+
+        void guild.members.fetch(userId)
+            .then((fetchedMember) => {
+                if (!fetchedMember.user.bot) {
+                    this.userMap.set(userId, fetchedMember.displayName);
+                }
+            })
+            .catch(() => undefined);
+    }
 }
 
 export class VcArticleSessionManager {
@@ -393,9 +377,9 @@ export class VcArticleSessionManager {
         return session;
     }
 
-    async cleanupSession(guildId: string): Promise<void> {
+    async cleanupSession(guildId: string, destroyConnection: boolean = true): Promise<void> {
         const session = this.getSession(guildId);
-        await session.discard();
+        await session.discard(destroyConnection);
     }
 
     cleanupDestroyedConnection(guildId: string, connection: VoiceConnection): void {

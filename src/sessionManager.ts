@@ -1,7 +1,5 @@
 import {
     VoiceConnection,
-    AudioReceiveStream,
-    EndBehaviorType,
     VoiceConnectionStatus,
 } from '@ovencord/voice';
 import { Client, TextChannel, Guild } from 'discord.js';
@@ -9,7 +7,7 @@ import { UserAudioRecorder } from './recorder';
 import { convertToMp3, cleanupFiles } from './audioProcessor';
 import { analyzeDiscussion } from './analyzer';
 import { getGuildSettings, GuildSettings } from './database';
-import { OpusDecoder } from './opusDecoder';
+import { attachVoiceCaptureConsumer } from './voiceCaptureHub';
 
 /**
  * ギルドごとのセッション
@@ -24,8 +22,7 @@ export class GuildSession {
     private isProcessLoopRunning: boolean = false;
     public isRecording: boolean = false;
     private settings: GuildSettings;
-    private opusDecoders: Map<string, OpusDecoder> = new Map();
-    private subscribedUsers: Set<string> = new Set();
+    private detachVoiceCapture: (() => void) | null = null;
     private apiKey: string | null = null;
     private statusMessage: any = null;
     private voiceChannelName: string = '';
@@ -62,54 +59,12 @@ export class GuildSession {
         this.currentStatus = '録音中';
         this.currentTaskLabel = '次回の自動分析を待機中';
         await this.refreshStatusMessage(undefined, true);
-
-        // ボイス受信のセットアップ
-        const receiver = connection.receiver;
-
-        // speaking イベントでユーザーの音声ストリームを取得
-        receiver.speaking.on('start', (userId: string) => {
-            if (this.subscribedUsers.has(userId)) return;
-            this.subscribedUsers.add(userId);
-
-            const opusStream = receiver.subscribe(userId, {
-                end: {
-                    behavior: EndBehaviorType.Manual,
-                },
-            });
-
-            // Opus デコーダーを作成
-            if (!this.opusDecoders.has(userId)) {
-                this.opusDecoders.set(userId, new OpusDecoder());
-            }
-            const decoder = this.opusDecoders.get(userId)!;
-
-            // Web Streams APIのリーダーでOpusパケットを読み取る
-            const reader = opusStream.stream.getReader();
-            const readLoop = async () => {
-                try {
-                    while (true) {
-                        const { done, value } = await reader.read();
-                        if (done || !value) break;
-
-                        if (!this.isRecording || !this.recorder) continue;
-
-                        try {
-                            const pcmData = decoder.decode(Buffer.from(value));
-                            if (pcmData) {
-                                this.recorder.write(userId, pcmData);
-                            }
-                        } catch (e) {
-                            // デコードエラーは無視（パケットロス等）
-                        }
-                    }
-                } catch (err: any) {
-                    console.error(`Audio stream error for user ${userId}:`, err.message);
-                } finally {
-                    this.subscribedUsers.delete(userId);
-                    this.opusDecoders.delete(userId);
-                }
-            };
-            readLoop();
+        this.detachFromVoiceCapture();
+        this.detachVoiceCapture = attachVoiceCaptureConsumer(connection, {
+            onAudio: (userId, pcmData) => {
+                if (!this.isRecording || !this.recorder) return;
+                this.recorder.write(userId, pcmData);
+            },
         });
 
         // 定期分析ループを開始
@@ -127,10 +82,9 @@ export class GuildSession {
         this.isProcessLoopRunning = false;
         this.isRecording = false;
         this.isProcessingAudio = false;
+        this.detachFromVoiceCapture();
         this.voiceConnection = null;
         this.recorder = null;
-        this.opusDecoders.clear();
-        this.subscribedUsers.clear();
         this.statusMessage = null;
         this.currentStatus = '切断済み';
         this.currentTaskLabel = '接続が破棄されました';
@@ -143,32 +97,32 @@ export class GuildSession {
     /**
      * 録音を停止する
      */
-    async stopRecording(skipFinal: boolean = false): Promise<void> {
+    async stopRecording(skipFinal: boolean = false, destroyConnection: boolean = true): Promise<void> {
         this.isProcessLoopRunning = false;
         this.currentStatus = skipFinal ? '停止処理中' : '最終分析中';
         this.currentTaskLabel = skipFinal ? '録音を停止しています' : '終了前の最終分析を準備しています';
         await this.refreshStatusMessage();
-        
-        if (!skipFinal && this.voiceConnection && this.isRecording && this.recorder) {
+
+        const activeConnection = this.voiceConnection;
+        const shouldRunFinal = !skipFinal && !!activeConnection && !!this.recorder;
+        this.detachFromVoiceCapture();
+        this.isRecording = false;
+
+        if (shouldRunFinal) {
             if (this.targetTextChannel) {
                 await this.targetTextChannel.send("🔄 終了前の最終分析を行っています...しばらくお待ちください。");
             }
             await this.processAudio(false, true);
         }
 
-        this.isRecording = false;
         this.isProcessingAudio = false;
         this.cycleStartedAt = null;
         this.currentStatus = '停止中';
         this.currentTaskLabel = '録音は停止しています';
 
-        // デコーダーのクリーンアップ
-        this.opusDecoders.clear();
-        this.subscribedUsers.clear();
-
-        if (this.voiceConnection) {
-            if (this.voiceConnection.state.status !== VoiceConnectionStatus.Destroyed) {
-                this.voiceConnection.destroy();
+        if (activeConnection) {
+            if (destroyConnection && activeConnection.state.status !== VoiceConnectionStatus.Destroyed) {
+                activeConnection.destroy();
             }
             this.voiceConnection = null;
         }
@@ -314,7 +268,7 @@ export class GuildSession {
      * 蓄積された音声を分析する
      */
     public async processAudio(isManual: boolean = false, isFinal: boolean = false): Promise<void> {
-        if (!this.recorder || !this.isRecording) return;
+        if (!this.recorder || (!this.isRecording && !isFinal)) return;
         if (this.isProcessingAudio) return;
 
         this.isProcessingAudio = true;
@@ -531,6 +485,15 @@ export class GuildSession {
             }
         }
     }
+
+    private detachFromVoiceCapture(): void {
+        if (!this.detachVoiceCapture) {
+            return;
+        }
+
+        this.detachVoiceCapture();
+        this.detachVoiceCapture = null;
+    }
 }
 
 /**
@@ -551,9 +514,13 @@ export class SessionManager {
         return this.sessions.get(guildId)!;
     }
 
-    async cleanupSession(guildId: string, skipFinal: boolean = false): Promise<void> {
+    async cleanupSession(
+        guildId: string,
+        skipFinal: boolean = false,
+        destroyConnection: boolean = true
+    ): Promise<void> {
         if (this.sessions.has(guildId)) {
-            await this.sessions.get(guildId)!.stopRecording(skipFinal);
+            await this.sessions.get(guildId)!.stopRecording(skipFinal, destroyConnection);
             this.sessions.delete(guildId);
         }
     }
