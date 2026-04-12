@@ -43,6 +43,35 @@ export interface VoiceConsumerDiagnosticsSnapshot {
     users: VoiceConsumerUserStats[];
 }
 
+export interface VoiceLiveConsumerTotals {
+    pcmPacketsDelivered: number;
+    pcmBytesDelivered: number;
+}
+
+export interface VoiceLiveUserStats {
+    userId: string;
+    daveDecryptFailures: number;
+    daveDecryptSuccesses: number;
+    opusPacketsReceived: number;
+    opusDecodeFailures: number;
+    pcmByConsumer: Record<string, VoiceLiveConsumerTotals>;
+}
+
+export interface VoiceLiveTotals {
+    userCount: number;
+    daveDecryptFailures: number;
+    daveDecryptSuccesses: number;
+    opusPacketsReceived: number;
+    opusDecodeFailures: number;
+    pcmByConsumer: Record<string, VoiceLiveConsumerTotals>;
+}
+
+export interface VoiceConnectionLiveSnapshot {
+    createdAt: string;
+    users: VoiceLiveUserStats[];
+    totals: VoiceLiveTotals;
+}
+
 function emptyCounters(): UserCounters {
     return {
         daveDecryptFailures: 0,
@@ -63,6 +92,23 @@ function cloneCounterSnapshot(counter: UserCounters, consumerLabel: string): Use
         pcmPacketsDelivered: counter.pcmPacketsByConsumer.get(consumerLabel) || 0,
         pcmBytesDelivered: counter.pcmBytesByConsumer.get(consumerLabel) || 0,
     };
+}
+
+function cloneConsumerTotals(counter: UserCounters): Record<string, VoiceLiveConsumerTotals> {
+    const labels = new Set<string>([
+        ...counter.pcmPacketsByConsumer.keys(),
+        ...counter.pcmBytesByConsumer.keys(),
+    ]);
+    const result: Record<string, VoiceLiveConsumerTotals> = {};
+
+    for (const label of labels) {
+        result[label] = {
+            pcmPacketsDelivered: counter.pcmPacketsByConsumer.get(label) || 0,
+            pcmBytesDelivered: counter.pcmBytesByConsumer.get(label) || 0,
+        };
+    }
+
+    return result;
 }
 
 class VoiceConnectionDiagnostics {
@@ -185,6 +231,51 @@ class VoiceConnectionDiagnostics {
         };
     }
 
+    buildLiveSnapshot(): VoiceConnectionLiveSnapshot {
+        const users = Array.from(this.countersByUser.entries())
+            .sort(([leftUserId], [rightUserId]) => leftUserId.localeCompare(rightUserId))
+            .map(([userId, counters]) => ({
+                userId,
+                daveDecryptFailures: counters.daveDecryptFailures,
+                daveDecryptSuccesses: counters.daveDecryptSuccesses,
+                opusPacketsReceived: counters.opusPacketsReceived,
+                opusDecodeFailures: counters.opusDecodeFailures,
+                pcmByConsumer: cloneConsumerTotals(counters),
+            }));
+
+        const totals: VoiceLiveTotals = {
+            userCount: users.length,
+            daveDecryptFailures: 0,
+            daveDecryptSuccesses: 0,
+            opusPacketsReceived: 0,
+            opusDecodeFailures: 0,
+            pcmByConsumer: {},
+        };
+
+        for (const user of users) {
+            totals.daveDecryptFailures += user.daveDecryptFailures;
+            totals.daveDecryptSuccesses += user.daveDecryptSuccesses;
+            totals.opusPacketsReceived += user.opusPacketsReceived;
+            totals.opusDecodeFailures += user.opusDecodeFailures;
+
+            for (const [consumerLabel, consumerTotals] of Object.entries(user.pcmByConsumer)) {
+                const current = totals.pcmByConsumer[consumerLabel] || {
+                    pcmPacketsDelivered: 0,
+                    pcmBytesDelivered: 0,
+                };
+                current.pcmPacketsDelivered += consumerTotals.pcmPacketsDelivered;
+                current.pcmBytesDelivered += consumerTotals.pcmBytesDelivered;
+                totals.pcmByConsumer[consumerLabel] = current;
+            }
+        }
+
+        return {
+            createdAt: new Date().toISOString(),
+            users,
+            totals,
+        };
+    }
+
     private getUserCounters(userId: string): UserCounters {
         let counters = this.countersByUser.get(userId);
         if (!counters) {
@@ -206,4 +297,8 @@ export function ensureVoiceConnectionDiagnostics(connection: VoiceConnection): V
 
     diagnostics.ensureDaveInstrumentation();
     return diagnostics;
+}
+
+export function getVoiceConnectionLiveSnapshot(connection: VoiceConnection): VoiceConnectionLiveSnapshot {
+    return ensureVoiceConnectionDiagnostics(connection).buildLiveSnapshot();
 }

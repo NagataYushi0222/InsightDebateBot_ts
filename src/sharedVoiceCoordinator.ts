@@ -203,7 +203,12 @@ export class SharedVoiceCoordinator {
             return;
         }
 
-        const channel = guild.channels.cache.get(connection.joinConfig.channelId);
+        const channelId = connection.joinConfig.channelId;
+        if (!channelId) {
+            return;
+        }
+
+        const channel = guild.channels.cache.get(channelId);
         if (!channel?.isVoiceBased()) {
             return;
         }

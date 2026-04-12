@@ -52,7 +52,7 @@ export class VcArticleSession {
     private readonly consumerLabel: string;
     private lastVoiceStats: VoiceConsumerDiagnosticsSnapshot | null = null;
 
-    constructor(guildId: string, _bot: Client) {
+    constructor(guildId: string) {
         this.guildId = guildId;
         this.consumerLabel = `article:${guildId}`;
     }
@@ -71,6 +71,64 @@ export class VcArticleSession {
 
     hasTopicCache(): boolean {
         return !!this.finalized?.topicResult;
+    }
+
+    getStatusSummary(): {
+        status: string;
+        task: string;
+        pendingClipCount: number;
+        textEntryCount: number;
+        topicCount: number;
+        activeArchiveId: string | null;
+        activeArchiveLabel: string | null;
+    } {
+        const topicCount = this.finalized?.topicResult?.topics.length || 0;
+
+        if (this.isStopping) {
+            return {
+                status: '停止処理中',
+                task: 'VC から離脱し、保存済み音声から記事候補を抽出しています',
+                pendingClipCount: this.pendingAudioClips.length,
+                textEntryCount: this.textEntries.length,
+                topicCount,
+                activeArchiveId: this.finalized?.archiveId || null,
+                activeArchiveLabel: this.finalized?.summaryLabel || null,
+            };
+        }
+
+        if (this.isRecording) {
+            return {
+                status: '録音中',
+                task: '15分ごとに音声断片を確定しながら記事化用の素材を収集しています',
+                pendingClipCount: this.pendingAudioClips.length,
+                textEntryCount: this.textEntries.length,
+                topicCount,
+                activeArchiveId: this.finalized?.archiveId || null,
+                activeArchiveLabel: this.finalized?.summaryLabel || null,
+            };
+        }
+
+        if (this.finalized?.topicResult) {
+            return {
+                status: 'トピック保持中',
+                task: '保存済みの候補トピックを保持しており、記事生成を待機しています',
+                pendingClipCount: this.finalized.audioClips.length,
+                textEntryCount: this.finalized.textEntries.length,
+                topicCount,
+                activeArchiveId: this.finalized.archiveId,
+                activeArchiveLabel: this.finalized.summaryLabel,
+            };
+        }
+
+        return {
+            status: '停止中',
+            task: '記事化モードは待機しています',
+            pendingClipCount: 0,
+            textEntryCount: 0,
+            topicCount: 0,
+            activeArchiveId: null,
+            activeArchiveLabel: null,
+        };
     }
 
     getTopicResult(): TopicExtractionResult | null {
@@ -447,12 +505,14 @@ export class VcArticleSession {
 export class VcArticleSessionManager {
     private readonly sessions = new Map<string, VcArticleSession>();
 
-    constructor(private readonly bot: Client) {}
+    constructor(_bot: Client) {
+        void _bot;
+    }
 
     getSession(guildId: string): VcArticleSession {
         let session = this.sessions.get(guildId);
         if (!session) {
-            session = new VcArticleSession(guildId, this.bot);
+            session = new VcArticleSession(guildId);
             this.sessions.set(guildId, session);
         }
         return session;

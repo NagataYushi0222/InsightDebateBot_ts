@@ -25,12 +25,10 @@ export class GuildSession {
     private settings: GuildSettings;
     private detachVoiceCapture: (() => void) | null = null;
     private apiKey: string | null = null;
-    private statusMessage: any = null;
     private voiceChannelName: string = '';
     private cycleStartedAt: number | null = null;
     private currentStatus: string = '停止中';
     private currentTaskLabel: string = '待機中';
-    private lastStatusContent: string = '';
     private isProcessingAudio: boolean = false;
     // stop 中に start/now が割り込まないように、終了処理中を明示的に持つ。
     private isStopping: boolean = false;
@@ -56,7 +54,6 @@ export class GuildSession {
         connection: VoiceConnection,
         channel: TextChannel,
         apiKey: string | null = null,
-        initialMessage: any = null,
         voiceChannelName: string = 'Voice Channel'
     ): Promise<void> {
         this.voiceConnection = connection;
@@ -64,7 +61,6 @@ export class GuildSession {
         this.recorder = new UserAudioRecorder();
         this.isRecording = true;
         this.apiKey = apiKey;
-        this.statusMessage = null;
         this.voiceChannelName = voiceChannelName;
         this.lastVoiceStats = null;
         this.cycleStartedAt = Date.now();
@@ -125,7 +121,6 @@ export class GuildSession {
         this.voiceConnection = null;
         this.recorder = null;
         this.processingPromise = null;
-        this.statusMessage = null;
         this.currentStatus = '切断済み';
         this.currentTaskLabel = '接続が破棄されました';
         this.cycleStartedAt = null;
@@ -207,84 +202,18 @@ export class GuildSession {
         await this.refreshStatusMessage();
     }
 
-    private formatRemaining(seconds: number | null): string {
-        if (seconds === null) return '停止中';
-
-        const mins = Math.floor(seconds / 60);
-        const secs = seconds % 60;
-        return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
-    }
-
-    private buildStatusMessage(): string {
-        this.settings = getGuildSettings(this.guildId);
-        const interval = this.settings.recording_interval || 300;
-        const intervalLabel = interval >= 60
-            ? `${interval}秒 (${(interval / 60).toFixed(1)}分)`
-            : `${interval}秒`;
-        const remaining = this.getRemainingSeconds();
-        const headerLine = this.isRecording
-            ? `👥｜**${this.voiceChannelName}** の分析を実行中です。`
-            : `👥｜**${this.voiceChannelName}** の分析は停止しています。`;
-
-        return [
-            headerLine,
-            'プライバシー保護のため、録音・分析が行われることを参加者に周知してください。',
-            `\`[設定] 間隔: ${intervalLabel} / モード: ${this.settings.analysis_mode}\``,
-            `📡 現在の状態: **${this.currentStatus}**`,
-            `🛠️ 現在の処理: ${this.currentTaskLabel}`,
-            `⏳ 次のレポート出力まで: ${this.formatRemaining(remaining)}`,
-        ].join('\n');
-    }
-
     private async clearStatusMessage(): Promise<void> {
-        if (!this.statusMessage) {
-            this.lastStatusContent = '';
-            return;
-        }
-
-        try {
-            await this.statusMessage.delete();
-        } catch {
-            // ignore
-        } finally {
-            this.statusMessage = null;
-            this.lastStatusContent = '';
-        }
+        // 実際の Discord message 編集は LiveVoiceStatusDisplay が担当する。
+        // セッション側では状態変数だけを更新し、このメソッド自体は no-op として残す。
     }
 
     private async replaceStatusMessage(): Promise<void> {
-        const nextContent = this.buildStatusMessage();
-
-        await this.clearStatusMessage();
-
-        if (!this.targetTextChannel) return;
-
-        try {
-            this.statusMessage = await this.targetTextChannel.send(nextContent);
-            this.lastStatusContent = nextContent;
-        } catch {
-            this.statusMessage = null;
-            this.lastStatusContent = '';
-        }
+        await this.refreshStatusMessage();
     }
 
     private async refreshStatusMessage(_afterMessage?: any, force: boolean = false): Promise<void> {
-        const nextContent = this.buildStatusMessage();
-        if (!force && nextContent === this.lastStatusContent) return;
-
-        if (!this.statusMessage) {
-            await this.replaceStatusMessage();
-            return;
-        }
-
-        try {
-            await this.statusMessage.edit({ content: nextContent });
-            this.lastStatusContent = nextContent;
-        } catch {
-            this.statusMessage = null;
-            this.lastStatusContent = '';
-            await this.replaceStatusMessage();
-        }
+        void _afterMessage;
+        void force;
     }
 
     /**
@@ -323,14 +252,15 @@ export class GuildSession {
      * 蓄積された音声を分析する
      */
     public async processAudio(isManual: boolean = false, isFinal: boolean = false): Promise<void> {
-        if (!this.recorder || (!this.isRecording && !isFinal)) return;
+        const recorder = this.recorder;
+        if (!recorder || (!this.isRecording && !isFinal)) return;
         if (this.processingPromise) {
             await this.processingPromise.catch(() => undefined);
             return;
         }
 
         let runPromise: Promise<void>;
-        runPromise = this.runProcessAudio(isManual, isFinal)
+        runPromise = this.runProcessAudio(recorder, isManual, isFinal)
             .finally(() => {
                 if (this.processingPromise === runPromise) {
                     this.processingPromise = null;
@@ -340,7 +270,11 @@ export class GuildSession {
         await runPromise;
     }
 
-    private async runProcessAudio(isManual: boolean = false, isFinal: boolean = false): Promise<void> {
+    private async runProcessAudio(
+        recorder: UserAudioRecorder,
+        isManual: boolean = false,
+        isFinal: boolean = false
+    ): Promise<void> {
         this.isProcessingAudio = true;
 
         const jobName = isManual ? 'Manual analysis' : 'Periodic analysis';
@@ -351,7 +285,7 @@ export class GuildSession {
             this.currentTaskLabel = '音声を確定しています';
             await this.refreshStatusMessage(undefined, true);
 
-            const userFilesRaw = await this.recorder.flushAudio();
+            const userFilesRaw = await recorder.flushAudio();
 
             if (userFilesRaw.size === 0) {
                 if (isFinal || !this.isRecording) {

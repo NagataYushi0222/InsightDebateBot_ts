@@ -2,52 +2,151 @@ import { GoogleGenAI } from '@google/genai';
 import fs from 'fs';
 import { GEMINI_API_KEY, GEMINI_MODEL_FLASH } from './config';
 import {
-    extractUrlsFromSearchTrace,
     generateContentWithWebSearch,
     SearchTrace,
 } from './geminiWebSearch';
 
-function extractGroundingUrls(response: any): string[] {
-    const chunks = response?.candidates?.[0]?.groundingMetadata?.groundingChunks;
-    if (!Array.isArray(chunks)) return [];
-
-    const urls = chunks
-        .map((chunk: any) => chunk?.web?.uri)
-        .filter((uri: unknown): uri is string => typeof uri === 'string' && uri.length > 0);
-
-    return Array.from(new Set(urls));
+interface SearchReferenceEntry {
+    refId: string;
+    title: string;
+    url: string;
+    query: string;
+    snippet: string;
 }
 
-function extractInlineUrls(text: string): string[] {
-    const matches = text.match(/https?:\/\/[^\s<>"')\]]+/g);
-    return matches ? Array.from(new Set(matches)) : [];
-}
+function buildSearchReferenceEntries(searchTrace: SearchTrace[]): SearchReferenceEntry[] {
+    const seenReferenceIds = new Set<string>();
+    const references: SearchReferenceEntry[] = [];
 
-function upsertReferenceUrls(reportText: string, urls: string[]): string {
-    const uniqueUrls = Array.from(new Set(urls));
-    if (uniqueUrls.length === 0) return reportText;
+    for (const trace of searchTrace) {
+        for (const result of trace.results) {
+            if (!result.url || seenReferenceIds.has(result.referenceId)) {
+                continue;
+            }
 
-    const referenceSection = `【参考URL】\n${uniqueUrls.map((url) => `- ${url}`).join('\n')}`;
-    const referenceSectionPattern = /【参考URL】[\s\S]*$/;
-
-    if (referenceSectionPattern.test(reportText)) {
-        return reportText.replace(referenceSectionPattern, referenceSection);
+            seenReferenceIds.add(result.referenceId);
+            references.push({
+                refId: result.referenceId,
+                title: result.title,
+                url: result.url,
+                query: trace.query,
+                snippet: result.snippet,
+            });
+        }
     }
 
-    return `${reportText}\n\n${referenceSection}`;
+    return references;
 }
 
-function appendReferenceUrls(reportText: string, response: any, searchTrace: SearchTrace[]): string {
-    const urls = [
-        ...extractInlineUrls(reportText),
-        ...extractUrlsFromSearchTrace(searchTrace),
-        ...extractGroundingUrls(response),
-    ];
-    if (urls.length === 0) {
+function stripReferenceSection(reportText: string): string {
+    return reportText.replace(/\n*【参考URL】[\s\S]*$/, '').trimEnd();
+}
+
+function buildReferenceSection(
+    references: SearchReferenceEntry[],
+    allReferenceCount: number,
+): string {
+    if (references.length === 0) {
+        if (allReferenceCount === 0) {
+            return '【参考URL】\n- 検索結果から有効なURLを取得できませんでした。';
+        }
+
+        return '【参考URL】\n- 本文中で参考番号が引用されなかったため、実際に参照したURLを特定できませんでした。';
+    }
+
+    return [
+        '【参考URL】',
+        ...references.map((reference) => `[${reference.refId}] ${reference.title}\n${reference.url}`),
+    ].join('\n');
+}
+
+function extractReferencedIds(reportText: string): Set<string> {
+    const ids = new Set<string>();
+    const matches = reportText.matchAll(/\[(参考\d+)\]/g);
+
+    for (const match of matches) {
+        const refId = match[1];
+        if (refId) {
+            ids.add(refId);
+        }
+    }
+
+    return ids;
+}
+
+function selectUsedReferences(
+    reportText: string,
+    references: SearchReferenceEntry[],
+): SearchReferenceEntry[] {
+    const referencedIds = extractReferencedIds(reportText);
+    if (referencedIds.size === 0) {
+        return [];
+    }
+
+    return references.filter((reference) => referencedIds.has(reference.refId));
+}
+
+function buildFactCheckFallbackSection(mode: string, references: SearchReferenceEntry[]): string {
+    const sectionTitle = mode === 'summary'
+        ? '【ファクトチェック】'
+        : '【争点と矛盾・ファクトチェック】';
+
+    if (references.length === 0) {
+        return `${sectionTitle}\n- 検索結果を取得できなかったため、根拠URL付きのファクトチェックは付与できませんでした。`;
+    }
+
+    const grouped = new Map<string, SearchReferenceEntry[]>();
+    for (const reference of references) {
+        const current = grouped.get(reference.query) || [];
+        current.push(reference);
+        grouped.set(reference.query, current);
+    }
+
+    const lines = [sectionTitle];
+
+    for (const [query, queryReferences] of grouped.entries()) {
+        const topReferences = queryReferences.slice(0, 2);
+        lines.push(`- 確認観点: ${query}`);
+        lines.push(`  - 参照: ${topReferences.map((reference) => `[${reference.refId}]`).join(', ')}`);
+
+        const snippet = topReferences
+            .map((reference) => reference.snippet)
+            .find((value) => value && value.length > 0);
+
+        if (snippet) {
+            lines.push(`  - 検索メモ: ${snippet}`);
+        }
+    }
+
+    return lines.join('\n');
+}
+
+function ensureFactCheckSection(
+    reportText: string,
+    mode: string,
+    references: SearchReferenceEntry[],
+): string {
+    const hasSummaryFactCheck = /【ファクトチェック】/.test(reportText);
+    const hasDebateFactCheck = /【争点と矛盾・ファクトチェック】/.test(reportText);
+
+    if ((mode === 'summary' && hasSummaryFactCheck) || (mode !== 'summary' && hasDebateFactCheck)) {
         return reportText;
     }
 
-    return upsertReferenceUrls(reportText, urls);
+    const fallbackSection = buildFactCheckFallbackSection(mode, references);
+    return `${reportText.trimEnd()}\n\n${fallbackSection}`;
+}
+
+function appendReferenceUrls(reportText: string, mode: string, searchTrace: SearchTrace[]): string {
+    const references = buildSearchReferenceEntries(searchTrace);
+    const factCheckedReport = ensureFactCheckSection(
+        stripReferenceSection(reportText),
+        mode,
+        references,
+    );
+    const usedReferences = selectUsedReferences(factCheckedReport, references);
+    const referenceSection = buildReferenceSection(usedReferences, references.length);
+    return `${factCheckedReport}\n\n${referenceSection}`;
 }
 
 /**
@@ -65,14 +164,16 @@ const PROMPTS: Record<string, string> = {
 4. **【重要】音声が無音、ノイズのみ、または意味のある会話が含まれていない場合は、無理に分析せず、「特に新しい議論はありませんでした。」とだけ出力してください。幻覚（ハルシネーション）を起こさないでください。**
 5. 「前回の文脈」はあくまで参考情報です。**今回提供された音声ファイルに含まれていない発言を、前回の文脈から捏造してレポートに含めないでください。**
 6. **ある参加者の発言を別の参加者に割り当てることは禁止です。**
+7. **検索結果に含まれていないURLを推測で書いてはいけません。URLの創作は禁止です。本文中に生URLを捏造せず、根拠は末尾の【参考URL】欄に載る実在URLだけを前提にしてください。**
+8. **検索結果を使った主張・制度説明・数値確認・ニュース確認には、必ず対応する参照番号（例: [参考1]）を本文に付けてください。参照番号が付いていない主張は根拠なしと見なされます。**
 
 出力項目:
 【議論の要約】: (300字以内)
 【各ユーザーの立場】: (ユーザー名: 賛成/反対/中立などの属性と主要な意見)
 【現在の対立構造】: (何がボトルネックで合意に至っていないか)
-【争点と矛盾・ファクトチェック】: (発言の矛盾点や、最新のネット情報と照らし合わせた誤りの指摘)
+【争点と矛盾・ファクトチェック】: (発言の矛盾点や、最新のネット情報と照らし合わせた誤りの指摘。各項目で「確認内容」「確認結果」「参照した参考番号([参考1]など)」を明記)
 【対立点の折衷案】: (対立点を解決するための折衷案の提案)
-【参考URL】: (Web検索で参照したURLを箇条書きで必ず列挙。最低1件。URLは省略せずフルで書く)
+【参考URL】: (Web検索で参照したURLを番号付きで列挙。形式は「[参考N] タイトル」の次の行にURL。本文ではこの番号を使って参照)
 
 **前置き・挨拶・自己紹介は一切不要です。上記の出力項目のみをそのまま出力してください。**
 `,
@@ -87,13 +188,16 @@ const PROMPTS: Record<string, string> = {
 4. **【重要】音声が無音、ノイズのみ、または意味のある会話が含まれていない場合は、無理に分析せず、「特に新しい議論はありませんでした。」とだけ出力してください。**
 5. 「前回の文脈」はあくまで参考情報です。**今回提供された音声ファイルに含まれていない発言を、前回の文脈から捏造してレポートに含めないでください。**
 6. **ある参加者の発言を別の参加者に割り当てることは禁止です。**
+7. **検索結果に含まれていないURLを推測で書いてはいけません。URLの創作は禁止です。本文中に生URLを捏造せず、根拠は末尾の【参考URL】欄に載る実在URLだけを前提にしてください。**
+8. **検索結果を使った主張・制度説明・数値確認・ニュース確認には、必ず対応する参照番号（例: [参考1]）を本文に付けてください。参照番号が付いていない主張は根拠なしと見なされます。**
 
 出力項目:
 【現在のトピック】: (今何を話しているか、数行でシンプルに)
 【これまでの流れ】: (時系列で主な発言と決定事項を箇条書き)
 【未解決の課題】: (まだ決まっていないこと、次に話すべきこと)
 【参加者の発言要旨】: (各参加者の主な主張)
-【参考URL】: (Web検索で参照したURLを箇条書きで必ず列挙。最低1件。URLは省略せずフルで書く)
+【ファクトチェック】: (制度・数値・固有名詞・ニュース性のある話題について確認した内容を箇条書きで記載。各項目で「確認内容」「確認結果」「参照した参考番号([参考1]など)」を明記)
+【参考URL】: (Web検索で参照したURLを番号付きで列挙。形式は「[参考N] タイトル」の次の行にURL。本文ではこの番号を使って参照)
 
 **前置き・挨拶・自己紹介は一切不要です。上記の出力項目のみをそのまま出力してください。**
 `,
@@ -251,7 +355,11 @@ export async function analyzeDiscussion(
 
             // クリーンアップ
             for (const f of uploadedFiles) await ai.files.delete({ name: f.name }).catch(() => { });
-            return appendReferenceUrls(response.text || '分析結果が空でした。', response, searchTrace);
+            return appendReferenceUrls(
+                response.text || '分析結果が空でした。',
+                mode,
+                searchTrace,
+            );
 
         } catch (e: any) {
             throw e;

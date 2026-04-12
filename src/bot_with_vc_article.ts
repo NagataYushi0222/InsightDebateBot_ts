@@ -29,6 +29,7 @@ import { VcArticleSessionManager } from './vcArticle/sessionManager';
 import { ArchivedSessionSummary, listArchivedSessions } from './vcArticle/storage';
 import { SharedVoiceCoordinator } from './sharedVoiceCoordinator';
 import { RuntimeMonitor } from './runtimeMonitor';
+import { LiveVoiceStatusDisplay } from './liveVoiceStatusDisplay';
 
 initDb();
 
@@ -45,6 +46,7 @@ const sessionManager = new SessionManager(client);
 const vcArticleManager = new VcArticleSessionManager(client);
 const sharedVoiceCoordinator = new SharedVoiceCoordinator(client, sessionManager, vcArticleManager);
 const runtimeMonitor = new RuntimeMonitor(client, sessionManager, vcArticleManager, sharedVoiceCoordinator);
+const liveVoiceStatusDisplay = new LiveVoiceStatusDisplay(client, sessionManager, vcArticleManager);
 
 const commands = [
     new SlashCommandBuilder()
@@ -408,9 +410,9 @@ async function handleAnalyzeStart(
             connection,
             interaction.channel as TextChannel,
             userKey,
-            initialMessage,
             voiceChannel.name
         );
+        liveVoiceStatusDisplay.bindMessage(guildId, initialMessage);
     } catch (error) {
         if (session.hasActiveConnection() || session.isBusy()) {
             await session.stopRecording(true, sharedVoiceCoordinator.shouldDestroyAnalyzeConnection(guildId));
@@ -441,7 +443,8 @@ async function handleAnalyzeStop(
             true,
             sharedVoiceCoordinator.shouldDestroyAnalyzeConnection(guildId)
         );
-        await interaction.followUp('✅ 分析を終了しました。お疲れ様でした！');
+        const message = await interaction.followUp('✅ 分析を終了しました。お疲れ様でした！');
+        liveVoiceStatusDisplay.bindMessage(guildId, message);
         return;
     }
 
@@ -467,14 +470,16 @@ async function handleAnalyzeStopFinal(
     }
 
     if (session.hasActiveConnection()) {
-        await interaction.followUp('🔄 最終レポートを作成して終了します。しばらくお待ちください...');
+        const progressMessage = await interaction.followUp('🔄 最終レポートを作成して終了します。しばらくお待ちください...');
+        liveVoiceStatusDisplay.bindMessage(guildId, progressMessage);
         runtimeMonitor.logSessionCleanup('manual_analyze_stop_final', guildId);
         await sessionManager.cleanupSession(
             guildId,
             false,
             sharedVoiceCoordinator.shouldDestroyAnalyzeConnection(guildId)
         );
-        await interaction.followUp('✅ 最終レポートを作成し、分析を終了しました。お疲れ様でした！');
+        const doneMessage = await interaction.followUp('✅ 最終レポートを作成し、分析を終了しました。お疲れ様でした！');
+        liveVoiceStatusDisplay.bindMessage(guildId, doneMessage);
         return;
     }
 
@@ -551,13 +556,14 @@ async function handleArticleStart(
         voiceChannel.name
     );
 
-    await interaction.followUp(
+    const initialMessage = await interaction.followUp(
         `📰 **VC記事化モードを開始しました**\n` +
         `対象VC: **${voiceChannel.name}**\n` +
         `${reused ? '🔗 同じVCで動作中の接続を共有して開始しました。\n' : ''}` +
         '録音終了後に `/article_stop` を実行すると、記事候補トピックを抽出します。\n' +
         '同じテキストチャンネルの投稿は、記事化の参考ログとして取り込みます。'
     );
+    liveVoiceStatusDisplay.bindMessage(guildId, initialMessage);
 }
 
 async function handleArticleStop(
@@ -582,11 +588,13 @@ async function handleArticleStop(
     }
 
     await interaction.deferReply();
-    await interaction.followUp('🔄 録音を停止しました。VC から退出し、記事候補トピックを抽出しています...');
+    const progressMessage = await interaction.followUp('🔄 録音を停止しました。VC から退出し、記事候補トピックを抽出しています...');
+    liveVoiceStatusDisplay.bindMessage(guildId, progressMessage);
     runtimeMonitor.logSessionCleanup('manual_article_stop', guildId);
     const topicResult = await articleSession.stopAndExtractTopics(
         sharedVoiceCoordinator.shouldDestroyArticleConnection(guildId)
     );
+    liveVoiceStatusDisplay.refreshNow(guildId);
     await followUpInChunks(interaction, formatTopicsMessage(topicResult, articleSession.getActiveArchiveId()));
 }
 
@@ -988,5 +996,6 @@ export function runBotWithVcArticle(): void {
         process.exit(1);
     }
     runtimeMonitor.start();
+    liveVoiceStatusDisplay.start();
     client.login(DISCORD_TOKEN);
 }

@@ -5,9 +5,13 @@ import {
 } from '@google/genai';
 import { searchWeb, WebSearchResult } from './searchTool';
 
+export interface SearchTraceResult extends WebSearchResult {
+    referenceId: string;
+}
+
 export interface SearchTrace {
     query: string;
-    results: WebSearchResult[];
+    results: SearchTraceResult[];
 }
 
 interface GenerateWithWebSearchOptions {
@@ -26,7 +30,7 @@ const SEARCH_FUNCTION_NAME = 'search_web';
 
 const SEARCH_FUNCTION_DECLARATION = {
     name: SEARCH_FUNCTION_NAME,
-    description: 'DuckDuckGo を使って Web 検索を実行し、最新の参考URLと要約を返します。',
+    description: 'DuckDuckGo を使って Web 検索を実行し、各結果に referenceId を付けて返します。回答では [参考1] のように referenceId を必ず引用してください。',
     parametersJsonSchema: {
         type: 'object',
         properties: {
@@ -71,6 +75,7 @@ export async function generateContentWithWebSearch(
     ];
     const searchTrace: SearchTrace[] = [];
     let hasAttemptedSearch = false;
+    let nextReferenceNumber = 1;
 
     for (let step = 0; step < maxSteps; step++) {
         const configObj: any = {
@@ -121,10 +126,11 @@ export async function generateContentWithWebSearch(
 
         const functionResponseParts = [];
         for (const call of functionCalls) {
+            const functionName = call.name || 'unknown_function';
             if (call.name !== SEARCH_FUNCTION_NAME) {
                 functionResponseParts.push(
-                    createPartFromFunctionResponse(call.id || '', call.name, {
-                        error: `Unsupported function: ${call.name}`,
+                    createPartFromFunctionResponse(call.id || '', functionName, {
+                        error: `Unsupported function: ${functionName}`,
                     }),
                 );
                 continue;
@@ -149,13 +155,17 @@ export async function generateContentWithWebSearch(
 
             try {
                 const results = await searchWeb(query, limit);
-                searchTrace.push({ query, results });
-                console.log(`[Web Search] ${query} -> ${results.length} result(s)`);
+                const referencedResults: SearchTraceResult[] = results.map((result) => ({
+                    ...result,
+                    referenceId: `参考${nextReferenceNumber++}`,
+                }));
+                searchTrace.push({ query, results: referencedResults });
+                console.log(`[Web Search] ${query} -> ${referencedResults.length} result(s)`);
                 functionResponseParts.push(
                     createPartFromFunctionResponse(call.id || '', call.name, {
                         output: {
                             query,
-                            results,
+                            results: referencedResults,
                         },
                     }),
                 );

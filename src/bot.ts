@@ -19,6 +19,7 @@ import {
 import { DISCORD_TOKEN, GUILD_ID, GEMINI_MODEL_FLASH, GEMINI_MODEL_3_FLASH, GEMINI_MODEL_31_FLASH_LITE, DEFAULT_MODEL } from './config';
 import { initDb, updateGuildSetting, getGuildSettings, getUserKey, setUserKey } from './database';
 import { SessionManager } from './sessionManager';
+import { LiveVoiceStatusDisplay } from './liveVoiceStatusDisplay';
 
 // データベース初期化
 initDb();
@@ -33,6 +34,7 @@ const client = new Client({
 });
 
 const sessionManager = new SessionManager(client);
+const liveVoiceStatusDisplay = new LiveVoiceStatusDisplay(client, sessionManager);
 
 function seedVoiceParticipants(connection: VoiceConnection, voiceChannel: VoiceBasedChannel): void {
     if (connection.state.status !== VoiceConnectionStatus.Ready) {
@@ -354,9 +356,9 @@ async function handleAnalyzeStart(
             connection,
             interaction.channel as TextChannel,
             userKey,
-            initialMessage,
             voiceChannel.name
         );
+        liveVoiceStatusDisplay.bindMessage(guildId, initialMessage);
     } catch (e) {
         if (session.hasActiveConnection() || session.isBusy()) {
             await session.stopRecording(true);
@@ -382,7 +384,8 @@ async function handleAnalyzeStop(
 
     if (session.hasActiveConnection()) {
         await sessionManager.cleanupSession(guildId, true);
-        await interaction.followUp('✅ 分析を終了しました。お疲れ様でした！');
+        const message = await interaction.followUp('✅ 分析を終了しました。お疲れ様でした！');
+        liveVoiceStatusDisplay.bindMessage(guildId, message);
     } else {
         await interaction.followUp({
             content: '分析は実行されていません。',
@@ -407,9 +410,11 @@ async function handleAnalyzeStopFinal(
     }
 
     if (session.hasActiveConnection()) {
-        await interaction.followUp('🔄 最終レポートを作成して終了します。しばらくお待ちください...');
+        const progressMessage = await interaction.followUp('🔄 最終レポートを作成して終了します。しばらくお待ちください...');
+        liveVoiceStatusDisplay.bindMessage(guildId, progressMessage);
         await sessionManager.cleanupSession(guildId, false);
-        await interaction.followUp('✅ 最終レポートを作成し、分析を終了しました。お疲れ様でした！');
+        const doneMessage = await interaction.followUp('✅ 最終レポートを作成し、分析を終了しました。お疲れ様でした！');
+        liveVoiceStatusDisplay.bindMessage(guildId, doneMessage);
     } else {
         await interaction.followUp({
             content: '分析は実行されていません。',
@@ -606,5 +611,6 @@ export function runBot(): void {
         console.error('No DISCORD_TOKEN provided. Exiting.');
         process.exit(1);
     }
+    liveVoiceStatusDisplay.start();
     client.login(DISCORD_TOKEN);
 }
