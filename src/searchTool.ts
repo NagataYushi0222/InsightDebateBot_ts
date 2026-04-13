@@ -121,6 +121,48 @@ function looksLikeSoft404Page(text: string): boolean {
     return SOFT_404_PATTERNS.some((pattern) => pattern.test(normalized));
 }
 
+async function fetchBingRss(query: string): Promise<string> {
+    const url = `https://www.bing.com/search?format=rss&q=${encodeURIComponent(query)}`;
+    const response = await fetchWithTimeout(url, {
+        headers: SEARCH_REQUEST_HEADERS,
+    }, URL_VALIDATION_TIMEOUT_MS);
+
+    if (!response.ok) {
+        throw new Error(`Bing RSS request failed with status ${response.status}`);
+    }
+
+    return response.text();
+}
+
+function parseBingRssResults(xml: string): WebSearchResult[] {
+    const rawResults: WebSearchResult[] = [];
+    const itemRegex = /<item>([\s\S]*?)<\/item>/gi;
+
+    let match: RegExpExecArray | null;
+    while ((match = itemRegex.exec(xml)) && rawResults.length < SEARCH_RESULT_SCAN_LIMIT) {
+        const itemXml = match[1];
+        const titleMatch = itemXml.match(/<title>([\s\S]*?)<\/title>/i);
+        const linkMatch = itemXml.match(/<link>([\s\S]*?)<\/link>/i);
+        const descriptionMatch = itemXml.match(/<description>([\s\S]*?)<\/description>/i);
+
+        const title = titleMatch ? stripHtml(titleMatch[1]) : '';
+        const url = linkMatch ? decodeHtml(linkMatch[1]).trim() : '';
+        const snippet = descriptionMatch ? stripHtml(descriptionMatch[1]) : '';
+
+        if (!title || !url || !/^https?:\/\//i.test(url)) {
+            continue;
+        }
+
+        rawResults.push({
+            title,
+            url,
+            snippet,
+        });
+    }
+
+    return rawResults;
+}
+
 function isDuckDuckGoChallengePage(html: string): boolean {
     const normalized = html.slice(0, 12_000);
     return /Unfortunately,\s*bots use DuckDuckGo too\./i.test(normalized)
@@ -278,19 +320,45 @@ async function collectValidatedResults(rawResults: WebSearchResult[], limit: num
     return results;
 }
 
+async function searchWithBing(query: string, limit: number): Promise<WebSearchResult[]> {
+    const xml = await fetchBingRss(query);
+    const rawResults = parseBingRssResults(xml);
+    return collectValidatedResults(rawResults, limit);
+}
+
+async function searchWithDuckDuckGo(query: string, limit: number): Promise<WebSearchResult[]> {
+    const html = await fetchDuckDuckGoHtml(query);
+    const rawResults = parseDuckDuckGoResults(html);
+    return collectValidatedResults(rawResults, limit);
+}
+
 export async function searchWeb(query: string, limit: number = 5): Promise<WebSearchResult[]> {
     const safeLimit = Math.max(1, Math.min(limit, 5));
     const attemptedQueries = [query, ...buildFallbackQueries(query)];
 
     for (const attemptQuery of attemptedQueries) {
-        const html = await fetchDuckDuckGoHtml(attemptQuery);
-        const rawResults = parseDuckDuckGoResults(html);
-        const results = await collectValidatedResults(rawResults, safeLimit);
-        if (results.length > 0) {
-            if (attemptQuery !== query) {
-                console.log(`[Web Search] Fallback query used: "${attemptQuery}" (original: "${query}")`);
+        try {
+            const bingResults = await searchWithBing(attemptQuery, safeLimit);
+            if (bingResults.length > 0) {
+                if (attemptQuery !== query) {
+                    console.log(`[Web Search] Bing fallback query used: "${attemptQuery}" (original: "${query}")`);
+                }
+                return bingResults;
             }
-            return results;
+        } catch (error) {
+            console.error(`[Web Search] Bing search failed for "${attemptQuery}":`, error);
+        }
+
+        try {
+            const ddgResults = await searchWithDuckDuckGo(attemptQuery, safeLimit);
+            if (ddgResults.length > 0) {
+                if (attemptQuery !== query) {
+                    console.log(`[Web Search] DuckDuckGo fallback query used: "${attemptQuery}" (original: "${query}")`);
+                }
+                return ddgResults;
+            }
+        } catch (error) {
+            console.error(`[Web Search] DuckDuckGo search failed for "${attemptQuery}":`, error);
         }
     }
 

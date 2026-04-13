@@ -30,7 +30,7 @@ const SEARCH_FUNCTION_NAME = 'search_web';
 
 const SEARCH_FUNCTION_DECLARATION = {
     name: SEARCH_FUNCTION_NAME,
-    description: 'DuckDuckGo を使って Web 検索を実行し、各結果に referenceId を付けて返します。回答では [参考1] のように referenceId を必ず引用してください。',
+    description: 'Web 検索を実行し、各結果に referenceId を付けて返します。回答では [参考1] のように referenceId を必ず引用してください。',
     parametersJsonSchema: {
         type: 'object',
         properties: {
