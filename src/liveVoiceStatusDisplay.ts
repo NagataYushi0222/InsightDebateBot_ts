@@ -20,6 +20,8 @@ interface AnalyzeStatusSummary {
     status: string;
     task: string;
     remainingSeconds: number | null;
+    mode: string;
+    dialogueTheme: string | null;
 }
 
 interface ArticleStatusSummary {
@@ -248,6 +250,8 @@ export class LiveVoiceStatusDisplay {
             status: '停止中',
             task: '要約モードは待機しています',
             remainingSeconds: null,
+            mode: 'debate',
+            dialogueTheme: null,
         };
         const articleSummary: ArticleStatusSummary | null = articleSession?.getStatusSummary() || null;
         const connection = this.resolveVoiceConnection(guildId);
@@ -278,8 +282,12 @@ export class LiveVoiceStatusDisplay {
             `接続状態: \`${connectionStatus}\` / Bot在室: \`${botPresent ? 'yes' : 'no'}\` / BotのVC: \`${botVoiceChannelId || 'none'}\``,
             `観測話者数: \`${liveSnapshot?.totals.userCount || 0}\``,
             '',
-            '**要約モード**',
+            '**分析モード**',
             `状態: \`${analyzeSummary.status}\``,
+            `モード: \`${analyzeSummary.mode}\``,
+            ...(analyzeSummary.dialogueTheme
+                ? [`対話テーマ: ${truncateText(analyzeSummary.dialogueTheme, 120)}`]
+                : []),
             `処理: ${truncateText(analyzeSummary.task, 120)}`,
             `次回レポートまで: \`${formatRemaining(analyzeSummary.remainingSeconds)}\``,
             '',

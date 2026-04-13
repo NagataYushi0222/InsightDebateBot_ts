@@ -12,6 +12,21 @@ import type { VoiceConsumerDiagnosticsSnapshot } from './voiceDiagnostics';
 
 type StatusAnchorHandler = (guildId: string, message: Message) => Promise<void> | void;
 
+export interface AnalyzeSessionStartOptions {
+    apiKey?: string | null;
+    voiceChannelName?: string;
+    analysisMode?: string;
+    dialogueTheme?: string | null;
+}
+
+export interface AnalyzeStatusSummary {
+    status: string;
+    task: string;
+    remainingSeconds: number | null;
+    mode: string;
+    dialogueTheme: string | null;
+}
+
 /**
  * ギルドごとのセッション
  */
@@ -42,6 +57,8 @@ export class GuildSession {
     private readonly consumerLabel: string;
     private lastVoiceStats: VoiceConsumerDiagnosticsSnapshot | null = null;
     private statusAnchorHandler: StatusAnchorHandler | null = null;
+    private activeAnalysisMode: string = 'debate';
+    private activeDialogueTheme: string | null = null;
 
     constructor(guildId: string, bot: Client) {
         this.guildId = guildId;
@@ -60,15 +77,26 @@ export class GuildSession {
     async startRecording(
         connection: VoiceConnection,
         channel: TextChannel,
-        apiKey: string | null = null,
-        voiceChannelName: string = 'Voice Channel'
+        options: AnalyzeSessionStartOptions = {},
     ): Promise<void> {
+        const {
+            apiKey = null,
+            voiceChannelName = 'Voice Channel',
+            analysisMode,
+            dialogueTheme = null,
+        } = options;
+
         this.voiceConnection = connection;
         this.targetTextChannel = channel;
         this.recorder = new UserAudioRecorder();
         this.isRecording = true;
         this.apiKey = apiKey;
         this.voiceChannelName = voiceChannelName;
+        this.settings = getGuildSettings(this.guildId);
+        this.activeAnalysisMode = analysisMode || this.settings.analysis_mode || 'debate';
+        this.activeDialogueTheme = this.activeAnalysisMode === 'dialogue'
+            ? (dialogueTheme?.trim() || null)
+            : null;
         this.lastVoiceStats = null;
         this.cycleStartedAt = Date.now();
         this.currentStatus = '録音中';
@@ -128,6 +156,7 @@ export class GuildSession {
         this.voiceConnection = null;
         this.recorder = null;
         this.processingPromise = null;
+        this.activeDialogueTheme = null;
         this.currentStatus = '切断済み';
         this.currentTaskLabel = '接続が破棄されました';
         this.cycleStartedAt = null;
@@ -196,17 +225,27 @@ export class GuildSession {
         return Math.max(0, interval - elapsed);
     }
 
-    getStatusSummary(): { status: string; task: string; remainingSeconds: number | null } {
+    getStatusSummary(): AnalyzeStatusSummary {
         return {
             status: this.currentStatus,
             task: this.currentTaskLabel,
             remainingSeconds: this.getRemainingSeconds(),
+            mode: this.activeAnalysisMode,
+            dialogueTheme: this.activeDialogueTheme,
         };
     }
 
     async syncSettingsAndStatus(): Promise<void> {
         this.settings = getGuildSettings(this.guildId);
         await this.refreshStatusMessage();
+    }
+
+    getActiveAnalysisMode(): string {
+        return this.activeAnalysisMode;
+    }
+
+    getDialogueTheme(): string | null {
+        return this.activeDialogueTheme;
     }
 
     private async clearStatusMessage(): Promise<void> {
@@ -367,14 +406,15 @@ export class GuildSession {
             now.setHours(now.getUTCHours() + 9);
             const timestampStr = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}-${String(now.getUTCDate()).padStart(2, '0')} ${String(now.getUTCHours()).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')}`;
 
-            let threadName = `議論分析レポート ${timestampStr}`;
-            let headerPrefix = '📊 **議論分析レポート**';
+            const isDialogueMode = this.activeAnalysisMode === 'dialogue';
+            let threadName = `${isDialogueMode ? '対話レポート' : '議論分析レポート'} ${timestampStr}`;
+            let headerPrefix = isDialogueMode ? '💬 **対話レポート**' : '📊 **議論分析レポート**';
             if (isFinal) {
-                threadName = `議論分析レポート (最終) ${timestampStr}`;
-                headerPrefix = '🏁 **最終分析レポート**';
+                threadName = `${isDialogueMode ? '対話レポート' : '議論分析レポート'} (最終) ${timestampStr}`;
+                headerPrefix = isDialogueMode ? '🏁 **最終対話レポート**' : '🏁 **最終分析レポート**';
             } else if (isManual) {
-                threadName = `手動分析レポート ${timestampStr}`;
-                headerPrefix = '🚀 **手動分析レポート**';
+                threadName = `${isDialogueMode ? '手動対話レポート' : '手動分析レポート'} ${timestampStr}`;
+                headerPrefix = isDialogueMode ? '🚀 **手動対話レポート**' : '🚀 **手動分析レポート**';
             }
 
             try {
@@ -394,8 +434,9 @@ export class GuildSession {
                     this.lastContext,
                     userMap,
                     apiKeyToUse,
-                    this.settings.analysis_mode,
-                    this.settings.model_name
+                    this.activeAnalysisMode,
+                    this.settings.model_name,
+                    this.activeDialogueTheme,
                 );
 
                 if (!report || report.startsWith("⚠️") || report.startsWith("音声データがありません") || report.startsWith("❌")) {
@@ -421,13 +462,13 @@ export class GuildSession {
                 this.currentTaskLabel = 'レポート投稿中';
                 await this.refreshStatusMessage(undefined, true);
 
-                let titleText = `📅 自動分析 (${timestampStr})`;
+                let titleText = isDialogueMode ? `💬 対話レポート (${timestampStr})` : `📅 自動分析 (${timestampStr})`;
                 let embedColor = 0x3498db; // Blue
                 if (isFinal) {
-                    titleText = `🛑 セッション終了 (${timestampStr})`;
+                    titleText = isDialogueMode ? `🛑 対話セッション終了 (${timestampStr})` : `🛑 セッション終了 (${timestampStr})`;
                     embedColor = 0xe74c3c; // Red
                 } else if (isManual) {
-                    titleText = `📅 手動分析 (${timestampStr})`;
+                    titleText = isDialogueMode ? `💬 手動対話レポート (${timestampStr})` : `📅 手動分析 (${timestampStr})`;
                 }
 
                 const previewLength = 300;

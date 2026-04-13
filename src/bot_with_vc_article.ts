@@ -68,6 +68,28 @@ const commands = [
         .setDescription('最終レポートを作成してから分析を終了します'),
 
     new SlashCommandBuilder()
+        .setName('dialogue_start')
+        .setDescription('テーマを指定して対話モードを開始します')
+        .addStringOption((opt) =>
+            opt
+                .setName('theme')
+                .setDescription('今回の対話テーマ')
+                .setRequired(true)
+        ),
+
+    new SlashCommandBuilder()
+        .setName('dialogue_stop')
+        .setDescription('対話モードを終了します（最終レポートなし）'),
+
+    new SlashCommandBuilder()
+        .setName('dialogue_now')
+        .setDescription('対話モードのレポートを今すぐ作成します'),
+
+    new SlashCommandBuilder()
+        .setName('dialogue_stop_final')
+        .setDescription('最終レポートを作成してから対話モードを終了します'),
+
+    new SlashCommandBuilder()
         .setName('article_start')
         .setDescription('VC記事化用の録音を開始します'),
 
@@ -238,6 +260,18 @@ client.on('interactionCreate', async (interaction) => {
             case 'analyze_stop_final':
                 await handleAnalyzeStopFinal(interaction, guildId);
                 break;
+            case 'dialogue_start':
+                await handleDialogueStart(interaction, guildId);
+                break;
+            case 'dialogue_stop':
+                await handleDialogueStop(interaction, guildId);
+                break;
+            case 'dialogue_now':
+                await handleDialogueNow(interaction, guildId);
+                break;
+            case 'dialogue_stop_final':
+                await handleDialogueStopFinal(interaction, guildId);
+                break;
             case 'article_start':
                 await handleArticleStart(interaction, guildId);
                 break;
@@ -354,9 +388,26 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
     }
 });
 
-async function handleAnalyzeStart(
+interface AnalyzeStartHandlerOptions {
+    mode: string;
+    dialogueTheme?: string | null;
+    initialMessageBuilder: (params: {
+        voiceChannelName: string;
+        intervalMins: number;
+        reused: boolean;
+        mode: string;
+        dialogueTheme: string | null;
+    }) => string;
+}
+
+function getActiveAnalyzeModeText(mode: string): string {
+    return getModeDisplayName(mode);
+}
+
+async function startAnalyzeLikeSession(
     interaction: ChatInputCommandInteraction,
-    guildId: string
+    guildId: string,
+    options: AnalyzeStartHandlerOptions,
 ): Promise<void> {
     const userKey = getUserKey(interaction.user.id);
     if (!userKey) {
@@ -383,8 +434,8 @@ async function handleAnalyzeStart(
     const session = sessionManager.getSession(guildId);
     if (session.isBusy()) {
         await interaction.followUp(session.isStoppingInProgress()
-            ? '要約モードは終了処理中です。完了してからもう一度実行してください。'
-            : '既に分析を実行中です。');
+            ? '要約系セッションは終了処理中です。完了してからもう一度実行してください。'
+            : '既に要約系セッションを実行中です。');
         return;
     }
 
@@ -396,23 +447,27 @@ async function handleAnalyzeStart(
         );
 
         const settings = getGuildSettings(guildId);
-        const mode = settings.analysis_mode || 'debate';
         const interval = settings.recording_interval || 300;
         const intervalMins = Math.floor(interval / 60);
-
         const initialMessage = await interaction.followUp(
-            `👥｜**${voiceChannel.name}** の分析を開始しました。\n` +
-            'プライバシー保護のため、録音・分析が行われることを参加者に周知してください。\n' +
-            `\`[設定] 間隔: ${intervalMins}分 / モード: ${mode}\`\n\n` +
-            `${reused ? '🔗 同じVCで動作中の接続を共有して開始しました。\n' : ''}` +
-            `⏳ 次のレポート出力まで: 約 ${intervalMins}分`
+            options.initialMessageBuilder({
+                voiceChannelName: voiceChannel.name,
+                intervalMins,
+                reused,
+                mode: options.mode,
+                dialogueTheme: options.dialogueTheme?.trim() || null,
+            }),
         );
 
         await session.startRecording(
             connection,
             interaction.channel as TextChannel,
-            userKey,
-            voiceChannel.name
+            {
+                apiKey: userKey,
+                voiceChannelName: voiceChannel.name,
+                analysisMode: options.mode,
+                dialogueTheme: options.dialogueTheme?.trim() || null,
+            },
         );
         await liveVoiceStatusDisplay.bindMessage(guildId, initialMessage);
     } catch (error) {
@@ -423,36 +478,125 @@ async function handleAnalyzeStart(
     }
 }
 
-async function handleAnalyzeStop(
+async function stopAnalyzeLikeSession(
     interaction: ChatInputCommandInteraction,
-    guildId: string
+    guildId: string,
+    options: {
+        expectedMode?: string;
+        skipFinal: boolean;
+        stoppingLabel: string;
+        doneLabel: string;
+        notRunningLabel: string;
+        cleanupReason: string;
+    },
 ): Promise<void> {
     await interaction.deferReply();
     const session = sessionManager.getSession(guildId);
 
     if (session.isStoppingInProgress()) {
         await interaction.followUp({
-            content: '要約モードはすでに終了処理中です。',
+            content: '要約系セッションはすでに終了処理中です。',
             flags: MessageFlags.Ephemeral,
         });
         return;
     }
 
-    if (session.hasActiveConnection()) {
-        runtimeMonitor.logSessionCleanup('manual_analyze_stop', guildId);
-        await sessionManager.cleanupSession(
-            guildId,
-            true,
-            sharedVoiceCoordinator.shouldDestroyAnalyzeConnection(guildId)
-        );
-        const message = await interaction.followUp('✅ 分析を終了しました。お疲れ様でした！');
-        await liveVoiceStatusDisplay.bindMessage(guildId, message);
+    if (!session.hasActiveConnection()) {
+        await interaction.followUp({
+            content: options.notRunningLabel,
+            flags: MessageFlags.Ephemeral,
+        });
         return;
     }
 
-    await interaction.followUp({
-        content: '分析は実行されていません。',
-        flags: MessageFlags.Ephemeral,
+    if (options.expectedMode && session.getActiveAnalysisMode() !== options.expectedMode) {
+        await interaction.followUp({
+            content: `現在起動中なのは ${getActiveAnalyzeModeText(session.getActiveAnalysisMode())} です。`,
+            flags: MessageFlags.Ephemeral,
+        });
+        return;
+    }
+
+    if (!options.skipFinal) {
+        const progressMessage = await interaction.followUp(options.stoppingLabel);
+        await liveVoiceStatusDisplay.bindMessage(guildId, progressMessage);
+    }
+
+    runtimeMonitor.logSessionCleanup(options.cleanupReason, guildId);
+    await sessionManager.cleanupSession(
+        guildId,
+        options.skipFinal,
+        sharedVoiceCoordinator.shouldDestroyAnalyzeConnection(guildId)
+    );
+    const doneMessage = await interaction.followUp(options.doneLabel);
+    await liveVoiceStatusDisplay.bindMessage(guildId, doneMessage);
+}
+
+async function runAnalyzeLikeNow(
+    interaction: ChatInputCommandInteraction,
+    guildId: string,
+    options: {
+        expectedMode?: string;
+        startLabel: string;
+        notRunningLabel: string;
+    },
+): Promise<void> {
+    const session = sessionManager.getSession(guildId);
+
+    if (!session.isRecording) {
+        await interaction.reply({
+            content: options.notRunningLabel,
+            flags: MessageFlags.Ephemeral,
+        });
+        return;
+    }
+
+    if (options.expectedMode && session.getActiveAnalysisMode() !== options.expectedMode) {
+        await interaction.reply({
+            content: `現在起動中なのは ${getActiveAnalyzeModeText(session.getActiveAnalysisMode())} です。`,
+            flags: MessageFlags.Ephemeral,
+        });
+        return;
+    }
+
+    await interaction.reply({ content: options.startLabel });
+    await session.processAudio(true, false);
+}
+
+async function handleAnalyzeStart(
+    interaction: ChatInputCommandInteraction,
+    guildId: string
+): Promise<void> {
+    const settings = getGuildSettings(guildId);
+    const mode = settings.analysis_mode || 'debate';
+    if (mode === 'dialogue') {
+        await interaction.reply({
+            content: '対話モードは `/dialogue_start theme:...` で開始してください。',
+            flags: MessageFlags.Ephemeral,
+        });
+        return;
+    }
+    await startAnalyzeLikeSession(interaction, guildId, {
+        mode,
+        initialMessageBuilder: ({ voiceChannelName, intervalMins, reused }) =>
+            `👥｜**${voiceChannelName}** の分析を開始しました。\n` +
+            'プライバシー保護のため、録音・分析が行われることを参加者に周知してください。\n' +
+            `\`[設定] 間隔: ${intervalMins}分 / モード: ${mode}\`\n\n` +
+            `${reused ? '🔗 同じVCで動作中の接続を共有して開始しました。\n' : ''}` +
+            `⏳ 次のレポート出力まで: 約 ${intervalMins}分`,
+    });
+}
+
+async function handleAnalyzeStop(
+    interaction: ChatInputCommandInteraction,
+    guildId: string
+): Promise<void> {
+    await stopAnalyzeLikeSession(interaction, guildId, {
+        skipFinal: true,
+        stoppingLabel: '',
+        doneLabel: '✅ 分析を終了しました。お疲れ様でした！',
+        notRunningLabel: '分析は実行されていません。',
+        cleanupReason: 'manual_analyze_stop',
     });
 }
 
@@ -460,34 +604,12 @@ async function handleAnalyzeStopFinal(
     interaction: ChatInputCommandInteraction,
     guildId: string
 ): Promise<void> {
-    await interaction.deferReply();
-    const session = sessionManager.getSession(guildId);
-
-    if (session.isStoppingInProgress()) {
-        await interaction.followUp({
-            content: '要約モードはすでに終了処理中です。',
-            flags: MessageFlags.Ephemeral,
-        });
-        return;
-    }
-
-    if (session.hasActiveConnection()) {
-        const progressMessage = await interaction.followUp('🔄 最終レポートを作成して終了します。しばらくお待ちください...');
-        await liveVoiceStatusDisplay.bindMessage(guildId, progressMessage);
-        runtimeMonitor.logSessionCleanup('manual_analyze_stop_final', guildId);
-        await sessionManager.cleanupSession(
-            guildId,
-            false,
-            sharedVoiceCoordinator.shouldDestroyAnalyzeConnection(guildId)
-        );
-        const doneMessage = await interaction.followUp('✅ 最終レポートを作成し、分析を終了しました。お疲れ様でした！');
-        await liveVoiceStatusDisplay.bindMessage(guildId, doneMessage);
-        return;
-    }
-
-    await interaction.followUp({
-        content: '分析は実行されていません。',
-        flags: MessageFlags.Ephemeral,
+    await stopAnalyzeLikeSession(interaction, guildId, {
+        skipFinal: false,
+        stoppingLabel: '🔄 最終レポートを作成して終了します。しばらくお待ちください...',
+        doneLabel: '✅ 最終レポートを作成し、分析を終了しました。お疲れ様でした！',
+        notRunningLabel: '分析は実行されていません。',
+        cleanupReason: 'manual_analyze_stop_final',
     });
 }
 
@@ -495,17 +617,67 @@ async function handleAnalyzeNow(
     interaction: ChatInputCommandInteraction,
     guildId: string
 ): Promise<void> {
-    const session = sessionManager.getSession(guildId);
+    await runAnalyzeLikeNow(interaction, guildId, {
+        startLabel: '🔄 手動分析を開始しました...',
+        notRunningLabel: '分析は実行されていません。先に /analyze_start を実行してください。',
+    });
+}
 
-    if (session.isRecording) {
-        await interaction.reply({ content: '🔄 手動分析を開始しました...' });
-        await session.processAudio(true, false);
-        return;
-    }
+async function handleDialogueStart(
+    interaction: ChatInputCommandInteraction,
+    guildId: string,
+): Promise<void> {
+    const theme = interaction.options.getString('theme', true).trim();
+    await startAnalyzeLikeSession(interaction, guildId, {
+        mode: 'dialogue',
+        dialogueTheme: theme,
+        initialMessageBuilder: ({ voiceChannelName, intervalMins, reused, dialogueTheme }) =>
+            `💬 **対話モードを開始しました**\n` +
+            `対象VC: **${voiceChannelName}**\n` +
+            `テーマ: **${dialogueTheme || '未指定'}**\n` +
+            'プライバシー保護のため、録音・分析が行われることを参加者に周知してください。\n' +
+            `\`[設定] 間隔: ${intervalMins}分 / モード: dialogue\`\n` +
+            `${reused ? '🔗 同じVCで動作中の接続を共有して開始しました。\n' : ''}` +
+            `⏳ 次のテーマレポート出力まで: 約 ${intervalMins}分`,
+    });
+}
 
-    await interaction.reply({
-        content: '分析は実行されていません。先に /analyze_start を実行してください。',
-        flags: MessageFlags.Ephemeral,
+async function handleDialogueStop(
+    interaction: ChatInputCommandInteraction,
+    guildId: string,
+): Promise<void> {
+    await stopAnalyzeLikeSession(interaction, guildId, {
+        expectedMode: 'dialogue',
+        skipFinal: true,
+        stoppingLabel: '',
+        doneLabel: '✅ 対話モードを終了しました。お疲れ様でした！',
+        notRunningLabel: '対話モードは実行されていません。',
+        cleanupReason: 'manual_dialogue_stop',
+    });
+}
+
+async function handleDialogueStopFinal(
+    interaction: ChatInputCommandInteraction,
+    guildId: string,
+): Promise<void> {
+    await stopAnalyzeLikeSession(interaction, guildId, {
+        expectedMode: 'dialogue',
+        skipFinal: false,
+        stoppingLabel: '🔄 最終の対話レポートを作成して終了します。しばらくお待ちください...',
+        doneLabel: '✅ 最終の対話レポートを作成し、対話モードを終了しました。お疲れ様でした！',
+        notRunningLabel: '対話モードは実行されていません。',
+        cleanupReason: 'manual_dialogue_stop_final',
+    });
+}
+
+async function handleDialogueNow(
+    interaction: ChatInputCommandInteraction,
+    guildId: string,
+): Promise<void> {
+    await runAnalyzeLikeNow(interaction, guildId, {
+        expectedMode: 'dialogue',
+        startLabel: '🔄 手動で対話レポートを作成しています...',
+        notRunningLabel: '対話モードは実行されていません。先に /dialogue_start を実行してください。',
     });
 }
 
@@ -819,6 +991,8 @@ function getModeDisplayName(mode: string): string {
             return '🗣️ ディベート (debate)';
         case 'summary':
             return '📝 要約 (summary)';
+        case 'dialogue':
+            return '💬 対話 (dialogue)';
         default:
             return mode;
     }
@@ -837,6 +1011,7 @@ async function handleCheck(
     const modelName = settings.model_name || DEFAULT_MODEL;
     const modelDisplay = getModelDisplayName(modelName);
     const modeDisplay = getModeDisplayName(settings.analysis_mode || 'debate');
+    const activeModeDisplay = getModeDisplayName(liveStatus.mode || settings.analysis_mode || 'debate');
     const interval = settings.recording_interval || 300;
     const remainingLabel = liveStatus.remainingSeconds === null
         ? '停止中'
@@ -861,11 +1036,13 @@ async function handleCheck(
         `   \`${modelName}\``,
         '',
         `📋 **分析モード**: ${modeDisplay}`,
+        `🎯 **現在の実行モード**: ${activeModeDisplay}`,
+        ...(liveStatus.dialogueTheme ? [`🧵 **対話テーマ**: ${liveStatus.dialogueTheme}`] : []),
         '',
         `⏱️ **分析間隔**: ${interval}秒 (${(interval / 60).toFixed(1)}分)`,
         '',
-        `📡 **要約Bot状態**: ${statusEmoji} ${liveStatus.status}`,
-        `🛠️ **要約Bot処理**: ${liveStatus.task}`,
+        `📡 **分析Bot状態**: ${statusEmoji} ${liveStatus.status}`,
+        `🛠️ **分析Bot処理**: ${liveStatus.task}`,
         `⏳ **次回レポートまで**: ${remainingLabel}`,
         `📰 **記事化機能状態**: ${articleStatus}`,
         `🗂️ **選択中アーカイブ**: ${activeArchiveId}`,

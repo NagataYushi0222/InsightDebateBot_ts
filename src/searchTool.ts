@@ -5,6 +5,7 @@ export interface WebSearchResult {
     title: string;
     url: string;
     snippet: string;
+    sourceExcerpt?: string;
 }
 
 const SEARCH_REQUEST_HEADERS = {
@@ -76,6 +77,10 @@ function stripHtml(text: string): string {
     return decodeHtml(text.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim());
 }
 
+function normalizeText(text: string): string {
+    return text.replace(/\s+/g, ' ').trim();
+}
+
 function unwrapDuckDuckGoUrl(rawUrl: string): string {
     const uddgMatch = rawUrl.match(/[?&]uddg=([^&]+)/);
     if (uddgMatch?.[1]) {
@@ -120,8 +125,17 @@ function expandDomainVariants(term: string): string[] {
     return Array.from(new Set(variants.map((value) => value.trim()).filter(Boolean)));
 }
 
+function buildExcerptTerms(query: string): string[] {
+    return Array.from(new Set(
+        extractQueryTerms(query)
+            .flatMap((term) => expandDomainVariants(term))
+            .map((term) => term.toLowerCase())
+            .filter((term) => term.length >= 2)
+    ));
+}
+
 function scoreSearchResult(result: WebSearchResult, query: string): number {
-    const haystack = `${result.title} ${result.snippet}`.toLowerCase();
+    const haystack = `${result.title} ${result.snippet} ${result.sourceExcerpt || ''}`.toLowerCase();
     const terms = extractQueryTerms(query);
     if (terms.length === 0) {
         return 0;
@@ -206,6 +220,88 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
     }
 }
 
+function stripHtmlForReadableText(html: string): string {
+    const cleanedHtml = html
+        .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
+        .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
+        .replace(/<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi, ' ')
+        .replace(/<svg\b[^>]*>[\s\S]*?<\/svg>/gi, ' ')
+        .replace(/<iframe\b[^>]*>[\s\S]*?<\/iframe>/gi, ' ');
+
+    const mainMatch = cleanedHtml.match(/<(main|article)\b[^>]*>([\s\S]*?)<\/\1>/i);
+    const bodyMatch = cleanedHtml.match(/<body\b[^>]*>([\s\S]*?)<\/body>/i);
+    const preferredHtml = mainMatch?.[0] || bodyMatch?.[0] || cleanedHtml;
+
+    return stripHtml(preferredHtml);
+}
+
+function trimExcerpt(text: string, maxLength: number): string {
+    const normalized = normalizeText(text);
+    if (normalized.length <= maxLength) {
+        return normalized;
+    }
+
+    return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+}
+
+function extractRelevantSourceExcerpt(body: string, query: string, contentType: string): string {
+    const readableText = contentType.includes('text/plain')
+        ? normalizeText(body)
+        : stripHtmlForReadableText(body);
+    if (!readableText) {
+        return '';
+    }
+
+    const excerptTerms = buildExcerptTerms(query);
+    if (excerptTerms.length === 0) {
+        return trimExcerpt(readableText, 1_600);
+    }
+
+    const lowered = readableText.toLowerCase();
+    const windows: Array<{ start: number; end: number }> = [];
+
+    for (const term of excerptTerms) {
+        let cursor = 0;
+        while (cursor < lowered.length) {
+            const matchIndex = lowered.indexOf(term, cursor);
+            if (matchIndex === -1) {
+                break;
+            }
+
+            const start = Math.max(0, matchIndex - 180);
+            const end = Math.min(readableText.length, matchIndex + term.length + 220);
+            const previousWindow = windows[windows.length - 1];
+            if (previousWindow && start <= previousWindow.end + 80) {
+                previousWindow.end = Math.max(previousWindow.end, end);
+            } else {
+                windows.push({ start, end });
+            }
+
+            cursor = matchIndex + term.length;
+            if (windows.length >= 3) {
+                break;
+            }
+        }
+
+        if (windows.length >= 3) {
+            break;
+        }
+    }
+
+    if (windows.length === 0) {
+        return trimExcerpt(readableText, 1_600);
+    }
+
+    const passages = windows
+        .map(({ start, end }) => readableText.slice(start, end).trim())
+        .filter(Boolean);
+    if (passages.length === 0) {
+        return trimExcerpt(readableText, 1_600);
+    }
+
+    return trimExcerpt(passages.join(' ... '), 1_800);
+}
+
 function looksLikeSoft404Page(text: string): boolean {
     const normalized = text.replace(/\s+/g, ' ').trim().slice(0, 8_000);
     return SOFT_404_PATTERNS.some((pattern) => pattern.test(normalized));
@@ -267,7 +363,12 @@ function isDuckDuckGoChallengePage(html: string): boolean {
  * 404 / 410 のような明確な不在ページや、本文に "not found" が並ぶ soft 404 を弾く。
  * 一方で 401 / 403 は「存在はしているが bot からは制限されている」場合があるため許容する。
  */
-async function validateSearchResultUrl(rawUrl: string): Promise<string | null> {
+interface ResolvedSearchSource {
+    resolvedUrl: string;
+    sourceExcerpt: string;
+}
+
+async function validateSearchResultUrl(rawUrl: string, query: string): Promise<ResolvedSearchSource | null> {
     try {
         const response = await fetchWithTimeout(rawUrl, {
             headers: SEARCH_REQUEST_HEADERS,
@@ -288,14 +389,21 @@ async function validateSearchResultUrl(rawUrl: string): Promise<string | null> {
 
         const resolvedUrl = response.url || rawUrl;
         const contentType = response.headers.get('content-type') || '';
+        let sourceExcerpt = '';
         if (contentType.includes('text/html') || contentType.includes('text/plain')) {
             const body = await response.text();
             if (looksLikeSoft404Page(body)) {
                 return null;
             }
+            if (response.ok) {
+                sourceExcerpt = extractRelevantSourceExcerpt(body, query, contentType);
+            }
         }
 
-        return resolvedUrl;
+        return {
+            resolvedUrl,
+            sourceExcerpt,
+        };
     } catch {
         return null;
     }
@@ -366,7 +474,11 @@ function parseDuckDuckGoResults(html: string): WebSearchResult[] {
     return rawResults;
 }
 
-async function collectValidatedResults(rawResults: WebSearchResult[], limit: number): Promise<WebSearchResult[]> {
+async function collectValidatedResults(
+    rawResults: WebSearchResult[],
+    limit: number,
+    query: string,
+): Promise<WebSearchResult[]> {
     const results: WebSearchResult[] = [];
     const seenResolvedUrls = new Set<string>();
 
@@ -376,15 +488,16 @@ async function collectValidatedResults(rawResults: WebSearchResult[], limit: num
         }
 
         // DuckDuckGo 検索で見つかった候補でも、すでに消えているページは参考URLにしない。
-        const resolvedUrl = await validateSearchResultUrl(result.url);
-        if (!resolvedUrl || seenResolvedUrls.has(resolvedUrl)) {
+        const resolvedResult = await validateSearchResultUrl(result.url, query);
+        if (!resolvedResult || seenResolvedUrls.has(resolvedResult.resolvedUrl)) {
             continue;
         }
 
-        seenResolvedUrls.add(resolvedUrl);
+        seenResolvedUrls.add(resolvedResult.resolvedUrl);
         results.push({
             ...result,
-            url: resolvedUrl,
+            url: resolvedResult.resolvedUrl,
+            sourceExcerpt: resolvedResult.sourceExcerpt,
         });
     }
 
@@ -413,7 +526,7 @@ async function collectValidatedResults(rawResults: WebSearchResult[], limit: num
 async function searchWithBing(query: string, limit: number, relevanceQuery: string = query): Promise<WebSearchResult[]> {
     const xml = await fetchBingRss(query);
     const rawResults = parseBingRssResults(xml);
-    const validated = await collectValidatedResults(rawResults, limit);
+    const validated = await collectValidatedResults(rawResults, limit, relevanceQuery);
     const relevant = filterRelevantResults(validated, relevanceQuery);
     if (validated.length > 0 && relevant.length === 0) {
         console.log(`[Web Search] Bing results were discarded as irrelevant for "${relevanceQuery}".`);
@@ -424,7 +537,7 @@ async function searchWithBing(query: string, limit: number, relevanceQuery: stri
 async function searchWithDuckDuckGo(query: string, limit: number, relevanceQuery: string = query): Promise<WebSearchResult[]> {
     const html = await fetchDuckDuckGoHtml(query);
     const rawResults = parseDuckDuckGoResults(html);
-    const validated = await collectValidatedResults(rawResults, limit);
+    const validated = await collectValidatedResults(rawResults, limit, relevanceQuery);
     const relevant = filterRelevantResults(validated, relevanceQuery);
     if (validated.length > 0 && relevant.length === 0) {
         console.log(`[Web Search] DuckDuckGo results were discarded as irrelevant for "${relevanceQuery}".`);

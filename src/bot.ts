@@ -356,8 +356,11 @@ async function handleAnalyzeStart(
         await session.startRecording(
             connection,
             interaction.channel as TextChannel,
-            userKey,
-            voiceChannel.name
+            {
+                apiKey: userKey,
+                voiceChannelName: voiceChannel.name,
+                analysisMode: mode,
+            }
         );
         await liveVoiceStatusDisplay.bindMessage(guildId, initialMessage);
     } catch (e) {
@@ -558,6 +561,7 @@ function getModeDisplayName(mode: string): string {
     switch (mode) {
         case 'debate': return '🗣️ ディベート (debate)';
         case 'summary': return '📝 要約 (summary)';
+        case 'dialogue': return '💬 対話 (dialogue)';
         default: return mode;
     }
 }
@@ -574,6 +578,7 @@ async function handleCheck(
     const modelName = settings.model_name || DEFAULT_MODEL;
     const modelDisplay = getModelDisplayName(modelName);
     const modeDisplay = getModeDisplayName(settings.analysis_mode || 'debate');
+    const activeModeDisplay = getModeDisplayName(liveStatus.mode || settings.analysis_mode || 'debate');
     const interval = settings.recording_interval || 300;
     const remainingLabel = liveStatus.remainingSeconds === null
         ? '停止中'
@@ -589,13 +594,15 @@ async function handleCheck(
         `   \`${modelName}\``,
         '',
         `📋 **分析モード**: ${modeDisplay}`,
+        `🎯 **現在の実行モード**: ${activeModeDisplay}`,
+        ...(liveStatus.dialogueTheme ? [`🧵 **対話テーマ**: ${liveStatus.dialogueTheme}`] : []),
         '',
         `⏱️ **分析間隔**: ${interval}秒 (${(interval / 60).toFixed(1)}分)`,
         '',
         `🧠 **推論レベル**: 🔥 最高 (high)`,
         '',
-        `📡 **ステータス**: ${statusEmoji} ${liveStatus.status}`,
-        `🛠️ **現在の処理**: ${liveStatus.task}`,
+        `📡 **分析Bot状態**: ${statusEmoji} ${liveStatus.status}`,
+        `🛠️ **分析Bot処理**: ${liveStatus.task}`,
         `⏳ **次回レポートまで**: ${remainingLabel}`,
         '━━━━━━━━━━━━━━━━━━━━━━',
     ].join('\n');
