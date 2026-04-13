@@ -175,12 +175,20 @@ function buildFallbackQueries(query: string): string[] {
         );
     }
 
-    return Array.from(new Set([
-        combined,
-        broad,
-        ...uniqueTokens.slice(0, SEARCH_FALLBACK_QUERY_LIMIT),
-        ...domainVariants,
-    ])).filter((candidate) => candidate.length >= 2 && candidate !== query);
+    const fallbackCandidates = domainVariants.length > 0
+        ? [
+            combined,
+            broad,
+            ...domainVariants,
+        ]
+        : [
+            combined,
+            broad,
+            ...uniqueTokens.slice(0, SEARCH_FALLBACK_QUERY_LIMIT),
+        ];
+
+    return Array.from(new Set(fallbackCandidates))
+        .filter((candidate) => candidate.length >= 2 && candidate !== query);
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
