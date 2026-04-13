@@ -16,6 +16,7 @@ const SEARCH_RESULT_SCAN_LIMIT = 12;
 const URL_VALIDATION_TIMEOUT_MS = 8_000;
 const SEARCH_FALLBACK_QUERY_LIMIT = 3;
 const PYTHON_SEARCH_TIMEOUT_MS = 15_000;
+const MIN_RELEVANCE_SCORE = 2;
 const SOFT_404_PATTERNS = [
     /404/i,
     /page not found/i,
@@ -26,6 +27,23 @@ const SOFT_404_PATTERNS = [
     /指定されたページ.*見つかりません/i,
     /ファイルが存在しません/i,
 ];
+const QUERY_STOP_WORDS = new Set([
+    'ニュース',
+    '最新',
+    '最近',
+    '確認',
+    '確認内容',
+    '確認結果',
+    '確認してください',
+    '関連',
+    '関連する',
+    '内容',
+    '概要',
+    '仕組み',
+    '意味',
+    '可能性',
+    'わかりやすく',
+]);
 const execFileAsync = promisify(execFile);
 const PYTHON_DDG_FETCH_SCRIPT = `
 import sys
@@ -74,6 +92,59 @@ function sanitizeFallbackToken(token: string): string {
         .trim();
 }
 
+function extractQueryTerms(query: string): string[] {
+    const normalized = sanitizeFallbackToken(query);
+    return Array.from(new Set(
+        normalized
+            .split(/[\s,，、/・]+/)
+            .map((token) => token.trim())
+            .filter((token) => token.length >= 2)
+            .filter((token) => !QUERY_STOP_WORDS.has(token))
+            .filter((token) => !/^\d{4}年?$/.test(token))
+    ));
+}
+
+function expandDomainVariants(term: string): string[] {
+    const variants = [term];
+
+    if (term.includes('暗号資産交換業')) {
+        variants.push('暗号資産交換業', '暗号資産', '交換業', '交換業者', 'JVCEA', '金融庁', '仮想通貨');
+    } else if (term.includes('暗号資産')) {
+        variants.push('暗号資産', '仮想通貨', 'JVCEA', '金融庁');
+    } else if (term.includes('交換業')) {
+        variants.push('交換業', '交換業者');
+    } else if (term.includes('規制緩和')) {
+        variants.push('規制緩和', '規制');
+    }
+
+    return Array.from(new Set(variants.map((value) => value.trim()).filter(Boolean)));
+}
+
+function scoreSearchResult(result: WebSearchResult, query: string): number {
+    const haystack = `${result.title} ${result.snippet}`.toLowerCase();
+    const terms = extractQueryTerms(query);
+    if (terms.length === 0) {
+        return 0;
+    }
+
+    let score = 0;
+    for (const term of terms) {
+        const variants = expandDomainVariants(term);
+        const matchedVariant = variants.find((variant) => haystack.includes(variant.toLowerCase()));
+        if (!matchedVariant) {
+            continue;
+        }
+
+        score += matchedVariant.length >= 4 ? 2 : 1;
+    }
+
+    return score;
+}
+
+function filterRelevantResults(results: WebSearchResult[], query: string): WebSearchResult[] {
+    return results.filter((result) => scoreSearchResult(result, query) >= MIN_RELEVANCE_SCORE);
+}
+
 function buildFallbackQueries(query: string): string[] {
     const normalized = query
         .replace(/確認内容[:：]?/g, ' ')
@@ -93,11 +164,22 @@ function buildFallbackQueries(query: string): string[] {
     const uniqueTokens = Array.from(new Set([...quotedTokens, ...splitTokens]));
     const combined = uniqueTokens.slice(0, 4).join(' ').trim();
     const broad = uniqueTokens.slice(0, 2).join(' ').trim();
+    const domainVariants: string[] = [];
+
+    if (normalized.includes('暗号資産') || normalized.includes('仮想通貨')) {
+        domainVariants.push(
+            'JVCEA 暗号資産 交換業 規制',
+            '金融庁 暗号資産 交換業',
+            '暗号資産 交換業者 JVCEA',
+            '仮想通貨 交換業 規制 金融庁',
+        );
+    }
 
     return Array.from(new Set([
         combined,
         broad,
         ...uniqueTokens.slice(0, SEARCH_FALLBACK_QUERY_LIMIT),
+        ...domainVariants,
     ])).filter((candidate) => candidate.length >= 2 && candidate !== query);
 }
 
@@ -323,13 +405,23 @@ async function collectValidatedResults(rawResults: WebSearchResult[], limit: num
 async function searchWithBing(query: string, limit: number): Promise<WebSearchResult[]> {
     const xml = await fetchBingRss(query);
     const rawResults = parseBingRssResults(xml);
-    return collectValidatedResults(rawResults, limit);
+    const validated = await collectValidatedResults(rawResults, limit);
+    const relevant = filterRelevantResults(validated, query);
+    if (validated.length > 0 && relevant.length === 0) {
+        console.log(`[Web Search] Bing results were discarded as irrelevant for "${query}".`);
+    }
+    return relevant;
 }
 
 async function searchWithDuckDuckGo(query: string, limit: number): Promise<WebSearchResult[]> {
     const html = await fetchDuckDuckGoHtml(query);
     const rawResults = parseDuckDuckGoResults(html);
-    return collectValidatedResults(rawResults, limit);
+    const validated = await collectValidatedResults(rawResults, limit);
+    const relevant = filterRelevantResults(validated, query);
+    if (validated.length > 0 && relevant.length === 0) {
+        console.log(`[Web Search] DuckDuckGo results were discarded as irrelevant for "${query}".`);
+    }
+    return relevant;
 }
 
 export async function searchWeb(query: string, limit: number = 5): Promise<WebSearchResult[]> {
