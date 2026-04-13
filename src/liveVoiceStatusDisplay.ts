@@ -174,9 +174,7 @@ export class LiveVoiceStatusDisplay {
                     content: '📡 **VC稼働モニター**\n更新準備中...',
                 });
                 tracked.lastContent = '';
-            })
-            .then(async () => {
-                await this.refreshGuild(guildId);
+                await this.runRefresh(guildId);
             })
             .catch((error) => {
                 console.error(`[Live Status] Failed to bind monitor message for guild ${guildId}:`, error);
@@ -200,31 +198,46 @@ export class LiveVoiceStatusDisplay {
             return;
         }
 
-        tracked.refreshChain = tracked.refreshChain.then(async () => {
-            const payload = this.buildContent(guildId);
-            const nextContent = payload.content;
-
-            if (tracked.lastContent !== nextContent) {
-                try {
-                    await tracked.monitorMessage?.edit({ content: nextContent });
-                    tracked.lastContent = nextContent;
-                } catch (error) {
-                    console.error(`[Live Status] Failed to edit status message for guild ${guildId}:`, error);
-                    this.trackedMessages.delete(guildId);
-                    this.stopIfUnused();
-                    return;
-                }
-            }
-
-            if (!payload.keepTracking) {
-                this.trackedMessages.delete(guildId);
-                this.stopIfUnused();
-            }
-        }).catch((error) => {
+        tracked.refreshChain = tracked.refreshChain.then(() => this.runRefresh(guildId)).catch((error) => {
             console.error(`[Live Status] Failed to refresh guild ${guildId}:`, error);
         });
 
         await tracked.refreshChain;
+    }
+
+    /**
+     * 実際の描画更新を 1 回だけ行う本体。
+     *
+     * refreshGuild() は「直列化のためのキュー投入」だけを担当し、
+     * ここでは message.edit などの副作用だけを実行する。
+     * こう分けておくと、bindMessage() の処理中に refreshGuild() を await したときに
+     * 自分自身が積んだ Promise を再度待ってしまう自己デッドロックを避けられる。
+     */
+    private async runRefresh(guildId: string): Promise<void> {
+        const tracked = this.trackedMessages.get(guildId);
+        if (!tracked || !tracked.monitorMessage) {
+            return;
+        }
+
+        const payload = this.buildContent(guildId);
+        const nextContent = payload.content;
+
+        if (tracked.lastContent !== nextContent) {
+            try {
+                await tracked.monitorMessage.edit({ content: nextContent });
+                tracked.lastContent = nextContent;
+            } catch (error) {
+                console.error(`[Live Status] Failed to edit status message for guild ${guildId}:`, error);
+                this.trackedMessages.delete(guildId);
+                this.stopIfUnused();
+                return;
+            }
+        }
+
+        if (!payload.keepTracking) {
+            this.trackedMessages.delete(guildId);
+            this.stopIfUnused();
+        }
     }
 
     private buildContent(guildId: string): RenderedStatusPayload {
