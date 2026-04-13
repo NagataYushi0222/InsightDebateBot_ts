@@ -402,24 +402,24 @@ async function collectValidatedResults(rawResults: WebSearchResult[], limit: num
     return results;
 }
 
-async function searchWithBing(query: string, limit: number): Promise<WebSearchResult[]> {
+async function searchWithBing(query: string, limit: number, relevanceQuery: string = query): Promise<WebSearchResult[]> {
     const xml = await fetchBingRss(query);
     const rawResults = parseBingRssResults(xml);
     const validated = await collectValidatedResults(rawResults, limit);
-    const relevant = filterRelevantResults(validated, query);
+    const relevant = filterRelevantResults(validated, relevanceQuery);
     if (validated.length > 0 && relevant.length === 0) {
-        console.log(`[Web Search] Bing results were discarded as irrelevant for "${query}".`);
+        console.log(`[Web Search] Bing results were discarded as irrelevant for "${relevanceQuery}".`);
     }
     return relevant;
 }
 
-async function searchWithDuckDuckGo(query: string, limit: number): Promise<WebSearchResult[]> {
+async function searchWithDuckDuckGo(query: string, limit: number, relevanceQuery: string = query): Promise<WebSearchResult[]> {
     const html = await fetchDuckDuckGoHtml(query);
     const rawResults = parseDuckDuckGoResults(html);
     const validated = await collectValidatedResults(rawResults, limit);
-    const relevant = filterRelevantResults(validated, query);
+    const relevant = filterRelevantResults(validated, relevanceQuery);
     if (validated.length > 0 && relevant.length === 0) {
-        console.log(`[Web Search] DuckDuckGo results were discarded as irrelevant for "${query}".`);
+        console.log(`[Web Search] DuckDuckGo results were discarded as irrelevant for "${relevanceQuery}".`);
     }
     return relevant;
 }
@@ -430,7 +430,7 @@ export async function searchWeb(query: string, limit: number = 5): Promise<WebSe
 
     for (const attemptQuery of attemptedQueries) {
         try {
-            const bingResults = await searchWithBing(attemptQuery, safeLimit);
+            const bingResults = await searchWithBing(attemptQuery, safeLimit, query);
             if (bingResults.length > 0) {
                 if (attemptQuery !== query) {
                     console.log(`[Web Search] Bing fallback query used: "${attemptQuery}" (original: "${query}")`);
@@ -442,7 +442,7 @@ export async function searchWeb(query: string, limit: number = 5): Promise<WebSe
         }
 
         try {
-            const ddgResults = await searchWithDuckDuckGo(attemptQuery, safeLimit);
+            const ddgResults = await searchWithDuckDuckGo(attemptQuery, safeLimit, query);
             if (ddgResults.length > 0) {
                 if (attemptQuery !== query) {
                     console.log(`[Web Search] DuckDuckGo fallback query used: "${attemptQuery}" (original: "${query}")`);
