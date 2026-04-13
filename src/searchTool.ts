@@ -176,9 +176,15 @@ function buildFallbackQueries(query: string): string[] {
         .map(sanitizeFallbackToken)
         .filter((token) => token.length >= 2);
     const uniqueTokens = Array.from(new Set([...quotedTokens, ...splitTokens]));
+    const longTokens = uniqueTokens.filter((token) => token.length >= 6);
     const combined = uniqueTokens.slice(0, 4).join(' ').trim();
     const broad = uniqueTokens.slice(0, 2).join(' ').trim();
     const domainVariants: string[] = [];
+    const bibliographicVariants: string[] = [];
+    const looksLikeBibliographicQuery =
+        /論文集|論文|章|著者|目次|書籍|読書会|最終回|包摂|改良/.test(normalized)
+        || quotedTokens.length > 0
+        || longTokens.length >= 2;
 
     if (normalized.includes('暗号資産') || normalized.includes('仮想通貨')) {
         domainVariants.push(
@@ -189,15 +195,35 @@ function buildFallbackQueries(query: string): string[] {
         );
     }
 
+    if (looksLikeBibliographicQuery) {
+        for (const token of longTokens.slice(0, 3)) {
+            bibliographicVariants.push(
+                `"${token}"`,
+                `${token} 著者`,
+                `${token} 目次`,
+                `${token} 書籍`,
+            );
+        }
+
+        if (longTokens.length >= 2) {
+            bibliographicVariants.push(
+                `"${longTokens[0]}" "${longTokens[1]}"`,
+                `${longTokens[0]} ${longTokens[1]}`,
+            );
+        }
+    }
+
     const fallbackCandidates = domainVariants.length > 0
         ? [
             combined,
             broad,
             ...domainVariants,
+            ...bibliographicVariants,
         ]
         : [
             combined,
             broad,
+            ...bibliographicVariants,
             ...uniqueTokens.slice(0, SEARCH_FALLBACK_QUERY_LIMIT),
         ];
 

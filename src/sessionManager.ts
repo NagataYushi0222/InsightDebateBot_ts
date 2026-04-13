@@ -5,7 +5,7 @@ import {
 import { Client, TextChannel, Guild, Message } from 'discord.js';
 import { UserAudioRecorder } from './recorder';
 import { convertToMp3, cleanupFiles } from './audioProcessor';
-import { analyzeDiscussion } from './analyzer';
+import { analyzeDiscussion, StructuredDiscussionMemory } from './analyzer';
 import { getGuildSettings, GuildSettings } from './database';
 import { attachVoiceCaptureConsumer } from './voiceCaptureHub';
 import type { VoiceConsumerDiagnosticsSnapshot } from './voiceDiagnostics';
@@ -36,7 +36,7 @@ export class GuildSession {
     public voiceConnection: VoiceConnection | null = null;
     private recorder: UserAudioRecorder | null = null;
     public targetTextChannel: TextChannel | null = null;
-    private lastContext: string = '';
+    private structuredMemory: StructuredDiscussionMemory | null = null;
     private isProcessLoopRunning: boolean = false;
     public isRecording: boolean = false;
     private settings: GuildSettings;
@@ -429,15 +429,16 @@ export class GuildSession {
                 // 分析実行（スレッド作成前に行う）
                 this.currentTaskLabel = '回答生成中';
                 await this.refreshStatusMessage(undefined, true);
-                const report = await analyzeDiscussion(
+                const analysisResult = await analyzeDiscussion(
                     userFilesMp3,
-                    this.lastContext,
+                    this.structuredMemory,
                     userMap,
                     apiKeyToUse,
                     this.activeAnalysisMode,
                     this.settings.model_name,
                     this.activeDialogueTheme,
                 );
+                const report = analysisResult.report;
 
                 if (!report || report.startsWith("⚠️") || report.startsWith("音声データがありません") || report.startsWith("❌")) {
                     console.log(`[${this.guildId}] Analysis skipped or failed: ${report}`);
@@ -457,8 +458,8 @@ export class GuildSession {
                     return;
                 }
 
-                // コンテキストを更新
-                this.lastContext = report.slice(-2000);
+                // 次回用の文脈は自然文レポートではなく、構造化メモとして保持する。
+                this.structuredMemory = analysisResult.memory;
                 this.currentTaskLabel = 'レポート投稿中';
                 await this.refreshStatusMessage(undefined, true);
 
