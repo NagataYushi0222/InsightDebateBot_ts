@@ -167,7 +167,9 @@ export async function handleArticleLoadCommand(
     const articleSession = environment.vcArticleManager.getSession(guildId);
     if (articleSession.isBusy()) {
         await interaction.reply({
-            content: '記事化用の録音が実行中です。先に `/article_stop` を実行してください。',
+            content: articleSession.isStoppingInProgress()
+                ? '記事化セッションは停止処理中です。保存済み音声の整理とトピック抽出が終わるまで少し待ってから、`/article_topics` または `/article_load` を実行してください。'
+                : '記事化用の録音が実行中です。先に `/article_stop` を実行してください。',
             flags: MessageFlags.Ephemeral,
         });
         return;
