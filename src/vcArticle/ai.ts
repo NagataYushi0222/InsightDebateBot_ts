@@ -2,9 +2,21 @@ import fs from 'fs';
 import { GoogleGenAI } from '@google/genai';
 import { GEMINI_API_KEY, GEMINI_MODEL_FLASH } from '../config';
 import { generateContentWithWebSearch } from '../geminiWebSearch';
-import { ARTICLE_GENERATION_PROMPT, TOPIC_EXTRACTION_PROMPT } from './prompts';
+import {
+    ARTICLE_GENERATION_PROMPT,
+    TOPIC_EXTRACTION_FALLBACK_PROMPT,
+    TOPIC_EXTRACTION_PROMPT,
+} from './prompts';
 import { StoredAudioClip } from './storage';
 import { ArticleTopic, TextChatEntry, TopicExtractionResult } from './types';
+
+const FILE_UPLOAD_TIMEOUT_MS = 90_000;
+const FILE_PROCESSING_TIMEOUT_MS = 180_000;
+const FILE_STATUS_REQUEST_TIMEOUT_MS = 30_000;
+const TOPIC_EXTRACTION_TIMEOUT_MS = 180_000;
+const TOPIC_EXTRACTION_FALLBACK_TIMEOUT_MS = 90_000;
+
+export type ArticleProgressReporter = (message: string) => Promise<void> | void;
 
 // Gemini が ```json``` 付きで返しても JSON として読めるようにする。
 function stripCodeFence(text: string): string {
@@ -35,24 +47,102 @@ function toJsonResult(rawText: string): TopicExtractionResult {
     };
 }
 
-async function uploadToGemini(
-    ai: GoogleGenAI,
-    filePath: string,
-    mimeType: string = 'audio/mp3'
-) {
-    return ai.files.upload({
-        file: filePath,
-        config: { mimeType },
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+            reject(new Error(`${label}がタイムアウトしました。`));
+        }, timeoutMs);
+        timer.unref?.();
+
+        promise
+            .then((value) => {
+                clearTimeout(timer);
+                resolve(value);
+            })
+            .catch((error) => {
+                clearTimeout(timer);
+                reject(error);
+            });
     });
 }
 
-async function waitForFilesActive(ai: GoogleGenAI, files: any[]): Promise<void> {
-    for (const fileRef of files) {
+async function reportProgress(
+    onProgress: ArticleProgressReporter | undefined,
+    message: string,
+): Promise<void> {
+    if (!onProgress) return;
+
+    try {
+        await onProgress(message);
+    } catch {
+        // ignore progress update failures
+    }
+}
+
+function normalizeTopicExtractionError(error: unknown): Error {
+    const message = error instanceof Error ? error.message : String(error);
+
+    if (/timeout|timed out/i.test(message)) {
+        return new Error('記事候補の抽出がタイムアウトしました。時間を置いて再試行してください。');
+    }
+    if (/UNAVAILABLE|high demand/i.test(message)) {
+        return new Error('Gemini の混雑により記事候補を抽出できませんでした。少し時間を置いて再試行してください。');
+    }
+    if (/PERMISSION_DENIED|denied access/i.test(message)) {
+        return new Error('Gemini API の権限で記事候補を抽出できませんでした。API キー設定を確認してください。');
+    }
+
+    return error instanceof Error ? error : new Error(message);
+}
+
+function shouldRetryTopicExtraction(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return /timeout|timed out|UNAVAILABLE|high demand|search_web が呼ばれませんでした/i.test(message);
+}
+
+function isThinkingModel(modelName: string): boolean {
+    return modelName.includes('gemini-3.0') || modelName.includes('gemini-3.1');
+}
+
+async function uploadToGemini(
+    ai: GoogleGenAI,
+    filePath: string,
+    mimeType: string = 'audio/mp3',
+) {
+    return withTimeout(
+        ai.files.upload({
+            file: filePath,
+            config: { mimeType },
+        }),
+        FILE_UPLOAD_TIMEOUT_MS,
+        '音声ファイルのアップロード',
+    );
+}
+
+async function waitForFilesActive(
+    ai: GoogleGenAI,
+    files: any[],
+    onProgress?: ArticleProgressReporter,
+): Promise<void> {
+    for (const [index, fileRef] of files.entries()) {
+        const deadline = Date.now() + FILE_PROCESSING_TIMEOUT_MS;
+        await reportProgress(
+            onProgress,
+            `⏳ 音声ファイルを処理しています... (${index + 1}/${files.length})`,
+        );
+
         while (true) {
-            const currentFile = await ai.files.get({ name: fileRef.name });
+            const currentFile = await withTimeout(
+                ai.files.get({ name: fileRef.name }),
+                FILE_STATUS_REQUEST_TIMEOUT_MS,
+                `音声ファイル ${index + 1}/${files.length} の状態確認`,
+            );
             if (currentFile.state === 'ACTIVE') break;
             if (currentFile.state === 'FAILED') {
                 throw new Error(`File processing failed: ${currentFile.name}`);
+            }
+            if (Date.now() >= deadline) {
+                throw new Error(`音声ファイル ${index + 1}/${files.length} の処理がタイムアウトしました。`);
             }
             await new Promise((resolve) => setTimeout(resolve, 2000));
         }
@@ -79,7 +169,7 @@ function buildParticipantMap(audioClips: StoredAudioClip[]): Map<string, string>
 
 function buildSharedParts(
     audioClips: StoredAudioClip[],
-    textEntries: TextChatEntry[]
+    textEntries: TextChatEntry[],
 ): any[] {
     const parts: any[] = [];
     const participantMap = buildParticipantMap(audioClips);
@@ -108,26 +198,37 @@ function buildSharedParts(
 
 async function uploadAudioParts(
     ai: GoogleGenAI,
-    audioClips: StoredAudioClip[]
+    audioClips: StoredAudioClip[],
+    onProgress?: ArticleProgressReporter,
 ): Promise<{ uploadedFiles: any[]; audioParts: any[] }> {
     const uploadedFiles: any[] = [];
     const audioParts: any[] = [];
 
-    for (const clip of audioClips) {
-        const { userId, displayName, filePath, clipId } = clip;
-        if (!fs.existsSync(filePath)) continue;
+    try {
+        for (const [index, clip] of audioClips.entries()) {
+            const { userId, displayName, filePath, clipId } = clip;
+            if (!fs.existsSync(filePath)) continue;
 
-        const uploadedFile = await uploadToGemini(ai, filePath);
-        uploadedFiles.push(uploadedFile);
+            await reportProgress(
+                onProgress,
+                `⏫ 音声ファイルをアップロードしています... (${index + 1}/${audioClips.length})`,
+            );
 
-        // 各音声ファイルの直前に話者ラベルを置いて、誰の発言かを対応づける。
-        audioParts.push({ text: `発言者ラベル: ${displayName} [ID:${userId}] / 断片ID: ${clipId}` });
-        audioParts.push({
-            fileData: {
-                fileUri: uploadedFile.uri,
-                mimeType: uploadedFile.mimeType,
-            },
-        });
+            const uploadedFile = await uploadToGemini(ai, filePath);
+            uploadedFiles.push(uploadedFile);
+
+            // 各音声ファイルの直前に話者ラベルを置いて、誰の発言かを対応づける。
+            audioParts.push({ text: `発言者ラベル: ${displayName} [ID:${userId}] / 断片ID: ${clipId}` });
+            audioParts.push({
+                fileData: {
+                    fileUri: uploadedFile.uri,
+                    mimeType: uploadedFile.mimeType,
+                },
+            });
+        }
+    } catch (error) {
+        await cleanupUploads(ai, uploadedFiles);
+        throw error;
     }
 
     return { uploadedFiles, audioParts };
@@ -136,16 +237,95 @@ async function uploadAudioParts(
 async function cleanupUploads(ai: GoogleGenAI, uploadedFiles: any[]): Promise<void> {
     await Promise.all(
         uploadedFiles.map((fileRef) =>
-            ai.files.delete({ name: fileRef.name }).catch(() => undefined)
-        )
+            ai.files.delete({ name: fileRef.name }).catch(() => undefined),
+        ),
     );
+}
+
+async function generateTopicExtractionResult(
+    ai: GoogleGenAI,
+    useModel: string,
+    audioClips: StoredAudioClip[],
+    textEntries: TextChatEntry[],
+    onProgress: ArticleProgressReporter | undefined,
+    options: {
+        prompt: string;
+        timeoutMs: number;
+        useWebSearch: boolean;
+    },
+): Promise<TopicExtractionResult> {
+    const { uploadedFiles, audioParts } = await uploadAudioParts(ai, audioClips, onProgress);
+
+    if (uploadedFiles.length === 0) {
+        return { sessionSummary: '音声ファイルの準備に失敗しました。', topics: [] };
+    }
+
+    try {
+        await waitForFilesActive(ai, uploadedFiles, onProgress);
+
+        if (options.useWebSearch) {
+            await reportProgress(onProgress, '🔎 Web 検索を使いながら記事候補を抽出しています...');
+            const { response } = await withTimeout(
+                generateContentWithWebSearch(
+                    ai,
+                    useModel,
+                    [
+                        { text: options.prompt },
+                        ...buildSharedParts(audioClips, textEntries),
+                        ...audioParts,
+                    ],
+                    {
+                        responseMimeType: 'application/json',
+                        isThinkingModel: isThinkingModel(useModel),
+                        forceSearch: true,
+                    },
+                ),
+                options.timeoutMs,
+                '記事候補の抽出',
+            );
+            return toJsonResult(response.text || '{"sessionSummary":"","topics":[]}');
+        }
+
+        await reportProgress(onProgress, '🧠 軽量モードで記事候補を再抽出しています...');
+        const response = await withTimeout(
+            ai.models.generateContent({
+                model: useModel,
+                contents: [
+                    {
+                        role: 'user',
+                        parts: [
+                            { text: options.prompt },
+                            ...buildSharedParts(audioClips, textEntries),
+                            ...audioParts,
+                        ],
+                    },
+                ],
+                config: {
+                    responseMimeType: 'application/json',
+                    ...(isThinkingModel(useModel)
+                        ? {
+                            thinkingConfig: {
+                                thinkingLevel: 'HIGH' as any,
+                            },
+                        }
+                        : {}),
+                } as any,
+            }),
+            options.timeoutMs,
+            '軽量モードでの記事候補抽出',
+        );
+        return toJsonResult(response.text || '{"sessionSummary":"","topics":[]}');
+    } finally {
+        await cleanupUploads(ai, uploadedFiles);
+    }
 }
 
 export async function extractArticleTopics(
     audioClips: StoredAudioClip[],
     textEntries: TextChatEntry[],
     apiKey: string | null,
-    modelName: string | null
+    modelName: string | null,
+    onProgress?: ArticleProgressReporter,
 ): Promise<TopicExtractionResult> {
     if (audioClips.length === 0) {
         return { sessionSummary: '録音データがありませんでした。', topics: [] };
@@ -153,34 +333,59 @@ export async function extractArticleTopics(
 
     const ai = createAiClient(apiKey);
     const useModel = modelName || GEMINI_MODEL_FLASH;
-    const { uploadedFiles, audioParts } = await uploadAudioParts(ai, audioClips);
+    let lastResult: TopicExtractionResult | null = null;
 
-    if (uploadedFiles.length === 0) {
-        return { sessionSummary: '音声ファイルの準備に失敗しました。', topics: [] };
+    try {
+        const primaryResult = await generateTopicExtractionResult(
+            ai,
+            useModel,
+            audioClips,
+            textEntries,
+            onProgress,
+            {
+                prompt: TOPIC_EXTRACTION_PROMPT,
+                timeoutMs: TOPIC_EXTRACTION_TIMEOUT_MS,
+                useWebSearch: true,
+            },
+        );
+        if (primaryResult.topics.length > 0) {
+            return primaryResult;
+        }
+
+        lastResult = primaryResult;
+        await reportProgress(
+            onProgress,
+            '🔁 候補が見つからなかったため、軽量モードで候補を再抽出しています...',
+        );
+    } catch (error) {
+        if (!shouldRetryTopicExtraction(error)) {
+            throw normalizeTopicExtractionError(error);
+        }
+
+        await reportProgress(
+            onProgress,
+            '🔁 抽出に時間がかかっているため、軽量モードで候補を再抽出しています...',
+        );
     }
 
     try {
-        await waitForFilesActive(ai, uploadedFiles);
-
-        // トピック抽出では、音声・テキスト・検索結果を 1 回の生成にまとめて渡す。
-        const { response } = await generateContentWithWebSearch(
+        return await generateTopicExtractionResult(
             ai,
             useModel,
-            [
-                { text: TOPIC_EXTRACTION_PROMPT },
-                ...buildSharedParts(audioClips, textEntries),
-                ...audioParts,
-            ],
+            audioClips,
+            textEntries,
+            onProgress,
             {
-                responseMimeType: 'application/json',
-                isThinkingModel: useModel.includes('gemini-3.0') || useModel.includes('gemini-3.1'),
-                forceSearch: true,
+                prompt: TOPIC_EXTRACTION_FALLBACK_PROMPT,
+                timeoutMs: TOPIC_EXTRACTION_FALLBACK_TIMEOUT_MS,
+                useWebSearch: false,
             },
         );
-
-        return toJsonResult(response.text || '{"sessionSummary":"","topics":[]}');
-    } finally {
-        await cleanupUploads(ai, uploadedFiles);
+    } catch (error) {
+        if (lastResult) {
+            return lastResult;
+        }
+        throw normalizeTopicExtractionError(error);
     }
 }
 
@@ -189,7 +394,7 @@ export async function generateArticleFromTopic(
     textEntries: TextChatEntry[],
     topic: ArticleTopic,
     apiKey: string | null,
-    modelName: string | null
+    modelName: string | null,
 ): Promise<string> {
     if (audioClips.length === 0) {
         return '記事生成に必要な音声データがありません。';
@@ -219,7 +424,7 @@ export async function generateArticleFromTopic(
                 ...audioParts,
             ],
             {
-                isThinkingModel: useModel.includes('gemini-3.0') || useModel.includes('gemini-3.1'),
+                isThinkingModel: isThinkingModel(useModel),
                 forceSearch: true,
             },
         );

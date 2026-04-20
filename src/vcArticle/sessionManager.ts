@@ -8,7 +8,11 @@ import { getGuildSettings } from '../database';
 import { UserAudioRecorder } from '../recorder';
 import { attachVoiceCaptureConsumer } from '../voiceCaptureHub';
 import type { VoiceConsumerDiagnosticsSnapshot } from '../voiceDiagnostics';
-import { extractArticleTopics, generateArticleFromTopic } from './ai';
+import {
+    ArticleProgressReporter,
+    extractArticleTopics,
+    generateArticleFromTopic,
+} from './ai';
 import {
     loadArchivedSession,
     saveArchivedSession,
@@ -210,7 +214,10 @@ export class VcArticleSession {
         });
     }
 
-    async stopAndExtractTopics(destroyConnection: boolean = true): Promise<TopicExtractionResult> {
+    async stopAndExtractTopics(
+        destroyConnection: boolean = true,
+        onProgress?: ArticleProgressReporter,
+    ): Promise<TopicExtractionResult> {
         if (!this.recorder || !this.isRecording) {
             throw new Error('記事化用の録音セッションは開始されていません。');
         }
@@ -267,7 +274,8 @@ export class VcArticleSession {
                 archived.audioClips,
                 archived.textEntries,
                 apiKey,
-                settings.model_name
+                settings.model_name,
+                onProgress,
             );
             const summaryLabel = updateArchivedSessionSummaryLabel(
                 archived.archiveId,
@@ -314,12 +322,18 @@ export class VcArticleSession {
         );
     }
 
-    async loadArchiveAndExtractTopics(archiveId: string, apiKey: string | null): Promise<TopicExtractionResult> {
+    async loadArchiveAndExtractTopics(
+        archiveId: string,
+        apiKey: string | null,
+        onProgress?: ArticleProgressReporter,
+    ): Promise<TopicExtractionResult> {
         await this.clearFinalizedArtifacts();
         this.apiKey = apiKey;
 
+        console.log(`[VC Article] Loading archive ${archiveId}`);
         const archived = loadArchivedSession(archiveId, this.guildId);
         if (archived.topicResult) {
+            console.log(`[VC Article] Reusing cached topics for archive ${archiveId}`);
             this.finalized = {
                 archiveId: archived.archiveId,
                 createdAt: archived.createdAt,
@@ -333,12 +347,14 @@ export class VcArticleSession {
             return archived.topicResult;
         }
 
+        console.log(`[VC Article] Cached topics were missing for archive ${archiveId}; regenerating`);
         const settings = getGuildSettings(this.guildId);
         const topicResult = await extractArticleTopics(
             archived.audioClips,
             archived.textEntries,
             this.apiKey,
-            settings.model_name
+            settings.model_name,
+            onProgress,
         );
         const summaryLabel = updateArchivedSessionSummaryLabel(
             archived.archiveId,

@@ -10,7 +10,7 @@ import { SharedVoiceCoordinator } from '../sharedVoiceCoordinator';
 import { VcArticleSessionManager } from '../vcArticle/sessionManager';
 import { listArchivedSessions } from '../vcArticle/storage';
 import { formatArchiveListMessage, formatTopicsMessage } from './articleFormatting';
-import { followUpInChunks, replyInChunks } from './replies';
+import { editReplyInChunks, followUpInChunks, replyInChunks } from './replies';
 import { getRequiredUserApiKey } from './settings';
 
 interface ArticleEnvironment {
@@ -18,6 +18,43 @@ interface ArticleEnvironment {
     sharedVoiceCoordinator: SharedVoiceCoordinator;
     runtimeMonitor: RuntimeMonitor;
     liveVoiceStatusDisplay: LiveVoiceStatusDisplay;
+}
+
+function getErrorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+}
+
+function buildArticleLoadFailureMessage(archiveId: string, error: unknown): string {
+    return [
+        '❌ 保存済み音声から記事候補を作成できませんでした。',
+        `保存ID: ${archiveId}`,
+        `理由: ${getErrorMessage(error)}`,
+        '時間を置いて `/article_load` を再実行してください。',
+    ].join('\n');
+}
+
+function buildArticleStopFailureMessage(activeArchiveId: string | null, error: unknown): string {
+    return [
+        '❌ 記事候補の抽出に失敗しました。',
+        ...(activeArchiveId ? [`保存ID: ${activeArchiveId}`] : []),
+        `理由: ${getErrorMessage(error)}`,
+        ...(activeArchiveId
+            ? [`あとで \`/article_load archive_id:${activeArchiveId}\` を実行すると再抽出できます。`]
+            : []),
+    ].join('\n');
+}
+
+function createProgressReporter(interaction: ChatInputCommandInteraction) {
+    let lastMessage = '';
+
+    return async (message: string): Promise<void> => {
+        if (message === lastMessage) {
+            return;
+        }
+
+        lastMessage = message;
+        await interaction.editReply({ content: message });
+    };
 }
 
 export async function handleArticleStartCommand(
@@ -103,20 +140,30 @@ export async function handleArticleStopCommand(
     }
 
     await interaction.deferReply();
-    const progressMessage = await interaction.followUp('🔄 録音を停止しました。VC から退出し、記事候補トピックを抽出しています...');
+    const updateProgress = createProgressReporter(interaction);
+    await updateProgress('🔄 録音を停止しました。VC から退出し、記事候補トピックを抽出しています...');
+    const progressMessage = await interaction.fetchReply();
     await environment.liveVoiceStatusDisplay.bindMessage(guildId, progressMessage);
     environment.runtimeMonitor.logSessionCleanup('manual_article_stop', guildId);
-    const topicResult = await articleSession.stopAndExtractTopics(
-        environment.sharedVoiceCoordinator.shouldDestroyArticleConnection(guildId),
-    );
-    const lastMessage = await followUpInChunks(
-        interaction,
-        formatTopicsMessage(topicResult, articleSession.getActiveArchiveId()),
-    );
-    if (lastMessage) {
-        await environment.liveVoiceStatusDisplay.bindMessage(guildId, lastMessage);
-    } else {
-        environment.liveVoiceStatusDisplay.refreshNow(guildId);
+    try {
+        const topicResult = await articleSession.stopAndExtractTopics(
+            environment.sharedVoiceCoordinator.shouldDestroyArticleConnection(guildId),
+            updateProgress,
+        );
+        const lastMessage = await editReplyInChunks(
+            interaction,
+            formatTopicsMessage(topicResult, articleSession.getActiveArchiveId()),
+        );
+        if (lastMessage) {
+            await environment.liveVoiceStatusDisplay.bindMessage(guildId, lastMessage);
+        } else {
+            environment.liveVoiceStatusDisplay.refreshNow(guildId);
+        }
+    } catch (error) {
+        const errorMessage = await interaction.editReply({
+            content: buildArticleStopFailureMessage(articleSession.getActiveArchiveId(), error),
+        });
+        await environment.liveVoiceStatusDisplay.bindMessage(guildId, errorMessage);
     }
 }
 
@@ -176,15 +223,25 @@ export async function handleArticleLoadCommand(
     }
 
     await interaction.deferReply();
-    const progressMessage = await interaction.followUp(`📂 保存済み音声 ${archiveId} を読み込み、保存済み記事候補を確認しています...`);
+    const updateProgress = createProgressReporter(interaction);
+    await updateProgress(`📂 保存済み音声 ${archiveId} を読み込み、保存済み記事候補を確認しています...`);
+    const progressMessage = await interaction.fetchReply();
     await environment.liveVoiceStatusDisplay.bindMessage(guildId, progressMessage);
-    const topicResult = await articleSession.loadArchiveAndExtractTopics(archiveId, userKey);
-    const lastMessage = await followUpInChunks(
-        interaction,
-        formatTopicsMessage(topicResult, articleSession.getActiveArchiveId()),
-    );
-    if (lastMessage) {
-        await environment.liveVoiceStatusDisplay.bindMessage(guildId, lastMessage);
+
+    try {
+        const topicResult = await articleSession.loadArchiveAndExtractTopics(archiveId, userKey, updateProgress);
+        const lastMessage = await editReplyInChunks(
+            interaction,
+            formatTopicsMessage(topicResult, articleSession.getActiveArchiveId()),
+        );
+        if (lastMessage) {
+            await environment.liveVoiceStatusDisplay.bindMessage(guildId, lastMessage);
+        }
+    } catch (error) {
+        const errorMessage = await interaction.editReply({
+            content: buildArticleLoadFailureMessage(archiveId, error),
+        });
+        await environment.liveVoiceStatusDisplay.bindMessage(guildId, errorMessage);
     }
 }
 

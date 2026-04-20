@@ -41,6 +41,7 @@ export interface ArchivedSessionSummary {
     dateKey: string;
     voiceChannelName: string;
     summaryLabel: string | null;
+    hasTopicResult: boolean;
     speakerCount: number;
     fileCount: number;
     textEntryCount: number;
@@ -305,6 +306,7 @@ export function listArchivedSessions(limit: number = 20, guildId?: string): Arch
                 dateKey: metadata.dateKey,
                 voiceChannelName: metadata.voiceChannelName,
                 summaryLabel: metadata.summaryLabel || null,
+                hasTopicResult: metadata.topicResult !== undefined,
                 speakerCount: new Set(metadata.audioFiles.map((file) => file.userId)).size,
                 fileCount: metadata.audioFiles.length,
                 textEntryCount: metadata.textEntries.length,

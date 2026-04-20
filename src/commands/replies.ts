@@ -38,6 +38,20 @@ export async function followUpInChunks(
     return lastMessage;
 }
 
+export async function editReplyInChunks(
+    interaction: ChatInputCommandInteraction,
+    content: string,
+): Promise<Message | null> {
+    const chunks = splitForDiscord(content);
+    let lastMessage = await interaction.editReply(chunks[0]);
+
+    for (const chunk of chunks.slice(1)) {
+        lastMessage = await interaction.followUp(chunk);
+    }
+
+    return lastMessage;
+}
+
 export async function replyInChunks(
     interaction: ChatInputCommandInteraction,
     content: string,

@@ -56,8 +56,9 @@ export function formatArchiveListMessage(archives: ArchivedSessionSummary[]): st
     ];
 
     for (const archive of archives) {
-        lines.push(`- タイトル: ${archive.summaryLabel || '(未解析)'}`);
+        lines.push(`- タイトル: ${archive.summaryLabel || '(候補未生成)'}`);
         lines.push(`- ID: \`${archive.archiveId}\``);
+        lines.push(`  状態: ${archive.hasTopicResult ? '候補保存済み' : '候補未生成'}`);
         lines.push(`  日時: ${formatArchiveDate(archive.createdAt)} / VC: ${archive.voiceChannelName}`);
         lines.push(`  音声: ${archive.fileCount}ファイル / 話者: ${archive.speakerCount}人 / チャット: ${archive.textEntryCount}件 / 容量: ${formatBytes(archive.totalBytes)}`);
     }
