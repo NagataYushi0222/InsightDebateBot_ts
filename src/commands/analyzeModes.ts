@@ -8,6 +8,7 @@ import { VoiceConnection } from '@ovencord/voice';
 import { getGuildSettings } from '../database';
 import { LiveVoiceStatusDisplay } from '../liveVoiceStatusDisplay';
 import { SessionManager } from '../sessionManager';
+import { VoiceDisconnectReporter } from '../voiceDisconnectReporter';
 import { getModeDisplayName } from './display';
 import { getRequiredUserApiKey } from './settings';
 
@@ -20,6 +21,7 @@ export interface AnalyzeModeEnvironment {
         voiceChannel: VoiceBasedChannel;
     }) => Promise<{ connection: VoiceConnection; reused: boolean }>;
     shouldDestroyConnection: (guildId: string) => boolean;
+    voiceDisconnectReporter: VoiceDisconnectReporter;
     logCleanup?: (reason: string, guildId: string) => void;
 }
 
@@ -71,12 +73,17 @@ export async function startAnalyzeLikeSession(
         return;
     }
 
+    let joinedConnection: VoiceConnection | null = null;
+    let reusedConnection = false;
+
     try {
         const { connection, reused } = await environment.ensureVoiceConnection({
             guildId,
             interaction,
             voiceChannel,
         });
+        joinedConnection = connection;
+        reusedConnection = reused;
 
         const settings = getGuildSettings(guildId);
         const interval = settings.recording_interval || 300;
@@ -103,8 +110,33 @@ export async function startAnalyzeLikeSession(
         );
         await environment.liveVoiceStatusDisplay.bindMessage(guildId, initialMessage);
     } catch (error) {
-        if (session.hasActiveConnection() || session.isBusy()) {
-            await session.stopRecording(true, environment.shouldDestroyConnection(guildId));
+        const sessionStarted = session.hasActiveConnection() || session.isBusy();
+        const shouldDestroyConnection = sessionStarted
+            ? environment.shouldDestroyConnection(guildId)
+            : !!joinedConnection && !reusedConnection;
+
+        if (sessionStarted) {
+            if (shouldDestroyConnection) {
+                await environment.voiceDisconnectReporter.report({
+                    guildId,
+                    connection: session.voiceConnection || joinedConnection,
+                    reason: '要約系セッションの開始処理中にエラーが発生したため',
+                    detail: error instanceof Error ? error.message : String(error),
+                    fallbackTextChannel: interaction.channel as TextChannel | null,
+                });
+            }
+            await session.stopRecording(true, shouldDestroyConnection);
+        } else if (
+            shouldDestroyConnection
+            && joinedConnection
+        ) {
+            await environment.voiceDisconnectReporter.reportBeforeDestroy({
+                guildId,
+                connection: joinedConnection,
+                reason: '要約系セッションの開始処理中にエラーが発生したため',
+                detail: error instanceof Error ? error.message : String(error),
+                fallbackTextChannel: interaction.channel as TextChannel | null,
+            });
         }
         await interaction.followUp(`エラーが発生しました: ${error}`);
     }
@@ -155,14 +187,28 @@ export async function stopAnalyzeLikeSession(
         await environment.liveVoiceStatusDisplay.bindMessage(guildId, progressMessage);
     }
 
+    const shouldDestroyConnection = environment.shouldDestroyConnection(guildId);
+    if (shouldDestroyConnection) {
+        await environment.voiceDisconnectReporter.report({
+            guildId,
+            connection: session.voiceConnection,
+            reason: `/${interaction.commandName} が実行されたため`,
+            fallbackTextChannel: session.targetTextChannel || (interaction.channel as TextChannel | null),
+        });
+    }
+
     environment.logCleanup?.(options.cleanupReason, guildId);
     await environment.sessionManager.cleanupSession(
         guildId,
         options.skipFinal,
-        environment.shouldDestroyConnection(guildId),
+        shouldDestroyConnection,
     );
     const doneMessage = await interaction.followUp(options.doneLabel);
-    await environment.liveVoiceStatusDisplay.bindMessage(guildId, doneMessage);
+    if (shouldDestroyConnection) {
+        await environment.liveVoiceStatusDisplay.deleteMonitor(guildId);
+    } else {
+        await environment.liveVoiceStatusDisplay.bindMessage(guildId, doneMessage);
+    }
 }
 
 export async function runAnalyzeLikeNow(

@@ -32,6 +32,13 @@ interface VoiceStateWithDisconnectDetails {
     closeCode?: number;
 }
 
+export interface SharedVoiceDisconnectEvent {
+    guildId: string;
+    connection: VoiceConnection;
+    reason: string;
+    detail?: string;
+}
+
 export class SharedVoiceCoordinator {
     private readonly managedVoiceConnections = new WeakSet<VoiceConnection>();
     private readonly lastDaveReinitAt = new WeakMap<VoiceConnection, number>();
@@ -39,7 +46,8 @@ export class SharedVoiceCoordinator {
     constructor(
         private readonly client: Client,
         private readonly sessionManager: SessionManager,
-        private readonly vcArticleManager: VcArticleSessionManager
+        private readonly vcArticleManager: VcArticleSessionManager,
+        private readonly onVoiceDisconnect?: (event: SharedVoiceDisconnectEvent) => Promise<void> | void,
     ) {}
 
     getActiveGuildVoiceConnection(guildId: string): VoiceConnection | null {
@@ -108,7 +116,17 @@ export class SharedVoiceCoordinator {
         });
 
         this.registerManagedVoiceConnection(guildId, connection);
-        await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+        try {
+            await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+        } catch (error) {
+            await this.notifyBeforeDestroy({
+                guildId,
+                connection,
+                reason: 'VC 接続の開始中に Ready 状態へ到達できなかったため',
+                detail: error instanceof Error ? error.message : String(error),
+            });
+            throw error;
+        }
         return { connection, reused: false };
     }
 
@@ -167,6 +185,7 @@ export class SharedVoiceCoordinator {
                 ].join(' '),
             );
             if (newState.status === VoiceConnectionStatus.Disconnected) {
+                const detail = this.describeVoiceState(newState as VoiceStateWithDisconnectDetails);
                 console.warn(
                     `[Shared Voice] guild=${guildId} disconnected; waiting up to 5s for reconnect`,
                 );
@@ -174,12 +193,22 @@ export class SharedVoiceCoordinator {
                     .then(() => {
                         console.log(`[Shared Voice] guild=${guildId} reconnect attempt reached connecting`);
                     })
-                    .catch((error) => {
+                    .catch(async (error) => {
                         console.error(`[Shared Voice] guild=${guildId} reconnect failed, destroying connection:`, error);
-                        connection.destroy();
+                        await this.notifyBeforeDestroy({
+                            guildId,
+                            connection,
+                            reason: 'Discord の音声接続が切断され、5秒以内に再接続できなかったため',
+                            detail,
+                        });
                     });
             }
             if (newState.status === VoiceConnectionStatus.Destroyed) {
+                void this.notifyVoiceDisconnect({
+                    guildId,
+                    connection,
+                    reason: '音声接続が破棄されたため',
+                });
                 this.sessionManager.cleanupDestroyedConnection(guildId, connection);
                 this.vcArticleManager.cleanupDestroyedConnection(guildId, connection);
             }
@@ -285,5 +314,20 @@ export class SharedVoiceCoordinator {
             : 'unknown';
         const closeCode = state.closeCode !== undefined ? ` close_code=${state.closeCode}` : '';
         return `reason=${reasonLabel}${closeCode}`;
+    }
+
+    private async notifyVoiceDisconnect(event: SharedVoiceDisconnectEvent): Promise<void> {
+        try {
+            await this.onVoiceDisconnect?.(event);
+        } catch (error) {
+            console.error(`[Shared Voice] Failed to notify disconnect for guild ${event.guildId}:`, error);
+        }
+    }
+
+    private async notifyBeforeDestroy(event: SharedVoiceDisconnectEvent): Promise<void> {
+        await this.notifyVoiceDisconnect(event);
+        if (event.connection.state.status !== VoiceConnectionStatus.Destroyed) {
+            event.connection.destroy();
+        }
     }
 }

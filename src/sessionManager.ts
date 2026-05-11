@@ -485,7 +485,7 @@ export class GuildSession {
                 };
 
                 const starterMsg = await this.targetTextChannel.send({ embeds: [embed] });
-                if (this.statusAnchorHandler) {
+                if (!isFinal && this.isRecording && this.statusAnchorHandler) {
                     await this.statusAnchorHandler(this.guildId, starterMsg);
                 }
                 if (!isFinal) {

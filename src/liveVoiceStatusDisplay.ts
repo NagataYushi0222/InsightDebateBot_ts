@@ -172,7 +172,10 @@ export class LiveVoiceStatusDisplay {
                     await tracked.monitorMessage.delete().catch(() => undefined);
                 }
 
-                tracked.monitorMessage = await anchorMessage.channel.send({
+                const sendableChannel = anchorMessage.channel as {
+                    send(options: { content: string }): Promise<Message>;
+                };
+                tracked.monitorMessage = await sendableChannel.send({
                     content: '📡 **VC稼働モニター**\n更新準備中...',
                 });
                 tracked.lastContent = '';
@@ -192,6 +195,38 @@ export class LiveVoiceStatusDisplay {
      */
     refreshNow(guildId: string): void {
         void this.refreshGuild(guildId);
+    }
+
+    /**
+     * VC から離脱した時点で、稼働モニターはチャット欄に残さない。
+     *
+     * bind/refresh と同じキューに載せ、削除と edit が前後して古い monitor が復活しないようにする。
+     */
+    async deleteMonitor(guildId: string): Promise<void> {
+        const tracked = this.trackedMessages.get(guildId);
+        if (!tracked) {
+            this.stopIfUnused();
+            return;
+        }
+
+        const deleteTask = tracked.refreshChain.then(async () => {
+            const monitorMessage = tracked.monitorMessage;
+            tracked.monitorMessage = null;
+            tracked.lastContent = '';
+
+            if (monitorMessage) {
+                await monitorMessage.delete().catch((error) => {
+                    console.error(`[Live Status] Failed to delete monitor message for guild ${guildId}:`, error);
+                });
+            }
+        });
+        tracked.refreshChain = deleteTask;
+
+        await deleteTask;
+        if (this.trackedMessages.get(guildId) === tracked && tracked.refreshChain === deleteTask) {
+            this.trackedMessages.delete(guildId);
+            this.stopIfUnused();
+        }
     }
 
     private async refreshGuild(guildId: string): Promise<void> {

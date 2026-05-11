@@ -4,10 +4,12 @@ import {
     MessageFlags,
     TextChannel,
 } from 'discord.js';
+import { VoiceConnection } from '@ovencord/voice';
 import { LiveVoiceStatusDisplay } from '../liveVoiceStatusDisplay';
 import { RuntimeMonitor } from '../runtimeMonitor';
 import { SharedVoiceCoordinator } from '../sharedVoiceCoordinator';
 import { VcArticleSessionManager } from '../vcArticle/sessionManager';
+import { VoiceDisconnectReporter } from '../voiceDisconnectReporter';
 import { listArchivedSessions } from '../vcArticle/storage';
 import { formatArchiveListMessage, formatTopicsMessage } from './articleFormatting';
 import { editReplyInChunks, followUpInChunks, replyInChunks } from './replies';
@@ -18,6 +20,7 @@ interface ArticleEnvironment {
     sharedVoiceCoordinator: SharedVoiceCoordinator;
     runtimeMonitor: RuntimeMonitor;
     liveVoiceStatusDisplay: LiveVoiceStatusDisplay;
+    voiceDisconnectReporter: VoiceDisconnectReporter;
 }
 
 function getErrorMessage(error: unknown): string {
@@ -94,27 +97,60 @@ export async function handleArticleStartCommand(
 
     await interaction.deferReply();
 
-    const { connection, reused } = await environment.sharedVoiceCoordinator.ensureVoiceConnectionForChannel(
-        guildId,
-        voiceChannel,
-        interaction.guild!.voiceAdapterCreator,
-    );
-    await articleSession.startRecording(
-        connection,
-        interaction.channel as TextChannel,
-        interaction.guild as Guild,
-        userKey,
-        voiceChannel.name,
-    );
+    let joinedConnection: VoiceConnection | null = null;
+    let reusedConnection = false;
 
-    const initialMessage = await interaction.followUp(
-        `📰 **VC記事化モードを開始しました**\n` +
-        `対象VC: **${voiceChannel.name}**\n` +
-        `${reused ? '🔗 同じVCで動作中の接続を共有して開始しました。\n' : ''}` +
-        '録音終了後に `/article_stop` を実行すると、記事候補トピックを抽出します。\n' +
-        '同じテキストチャンネルの投稿は、記事化の参考ログとして取り込みます。',
-    );
-    await environment.liveVoiceStatusDisplay.bindMessage(guildId, initialMessage);
+    try {
+        const { connection, reused } = await environment.sharedVoiceCoordinator.ensureVoiceConnectionForChannel(
+            guildId,
+            voiceChannel,
+            interaction.guild!.voiceAdapterCreator,
+        );
+        joinedConnection = connection;
+        reusedConnection = reused;
+
+        await articleSession.startRecording(
+            connection,
+            interaction.channel as TextChannel,
+            interaction.guild as Guild,
+            userKey,
+            voiceChannel.name,
+        );
+
+        const initialMessage = await interaction.followUp(
+            `📰 **VC記事化モードを開始しました**\n` +
+            `対象VC: **${voiceChannel.name}**\n` +
+            `${reused ? '🔗 同じVCで動作中の接続を共有して開始しました。\n' : ''}` +
+            '録音終了後に `/article_stop` を実行すると、記事候補トピックを抽出します。\n' +
+            '同じテキストチャンネルの投稿は、記事化の参考ログとして取り込みます。',
+        );
+        await environment.liveVoiceStatusDisplay.bindMessage(guildId, initialMessage);
+    } catch (error) {
+        const shouldDestroyConnection = !!joinedConnection && !reusedConnection;
+
+        if (articleSession.hasActiveConnection() || articleSession.isBusy()) {
+            if (shouldDestroyConnection) {
+                await environment.voiceDisconnectReporter.report({
+                    guildId,
+                    connection: joinedConnection,
+                    reason: '記事化セッションの開始処理中にエラーが発生したため',
+                    detail: getErrorMessage(error),
+                    fallbackTextChannel: interaction.channel as TextChannel | null,
+                });
+            }
+            await environment.vcArticleManager.cleanupSession(guildId, shouldDestroyConnection);
+        } else if (shouldDestroyConnection && joinedConnection) {
+            await environment.voiceDisconnectReporter.reportBeforeDestroy({
+                guildId,
+                connection: joinedConnection,
+                reason: '記事化セッションの開始処理中にエラーが発生したため',
+                detail: getErrorMessage(error),
+                fallbackTextChannel: interaction.channel as TextChannel | null,
+            });
+        }
+
+        throw error;
+    }
 }
 
 export async function handleArticleStopCommand(
@@ -144,17 +180,28 @@ export async function handleArticleStopCommand(
     await updateProgress('🔄 録音を停止しました。VC から退出し、記事候補トピックを抽出しています...');
     const progressMessage = await interaction.fetchReply();
     await environment.liveVoiceStatusDisplay.bindMessage(guildId, progressMessage);
+    const shouldDestroyConnection = environment.sharedVoiceCoordinator.shouldDestroyArticleConnection(guildId);
+    if (shouldDestroyConnection) {
+        await environment.voiceDisconnectReporter.report({
+            guildId,
+            connection: articleSession.voiceConnection,
+            reason: '/article_stop が実行されたため',
+            fallbackTextChannel: articleSession.targetTextChannel || (interaction.channel as TextChannel | null),
+        });
+    }
     environment.runtimeMonitor.logSessionCleanup('manual_article_stop', guildId);
     try {
         const topicResult = await articleSession.stopAndExtractTopics(
-            environment.sharedVoiceCoordinator.shouldDestroyArticleConnection(guildId),
+            shouldDestroyConnection,
             updateProgress,
         );
         const lastMessage = await editReplyInChunks(
             interaction,
             formatTopicsMessage(topicResult, articleSession.getActiveArchiveId()),
         );
-        if (lastMessage) {
+        if (shouldDestroyConnection) {
+            await environment.liveVoiceStatusDisplay.deleteMonitor(guildId);
+        } else if (lastMessage) {
             await environment.liveVoiceStatusDisplay.bindMessage(guildId, lastMessage);
         } else {
             environment.liveVoiceStatusDisplay.refreshNow(guildId);
@@ -163,7 +210,11 @@ export async function handleArticleStopCommand(
         const errorMessage = await interaction.editReply({
             content: buildArticleStopFailureMessage(articleSession.getActiveArchiveId(), error),
         });
-        await environment.liveVoiceStatusDisplay.bindMessage(guildId, errorMessage);
+        if (shouldDestroyConnection) {
+            await environment.liveVoiceStatusDisplay.deleteMonitor(guildId);
+        } else {
+            await environment.liveVoiceStatusDisplay.bindMessage(guildId, errorMessage);
+        }
     }
 }
 
@@ -276,10 +327,21 @@ export async function handleArticleDiscardCommand(
     guildId: string,
     environment: ArticleEnvironment,
 ): Promise<void> {
+    const articleSession = environment.vcArticleManager.getSession(guildId);
+    const shouldDestroyConnection = environment.sharedVoiceCoordinator.shouldDestroyArticleConnection(guildId);
+    if (shouldDestroyConnection && articleSession.voiceConnection) {
+        await environment.voiceDisconnectReporter.report({
+            guildId,
+            connection: articleSession.voiceConnection,
+            reason: '/article_discard が実行されたため',
+            fallbackTextChannel: articleSession.targetTextChannel || (interaction.channel as TextChannel | null),
+        });
+    }
+
     environment.runtimeMonitor.logSessionCleanup('manual_article_discard', guildId);
     await environment.vcArticleManager.cleanupSession(
         guildId,
-        environment.sharedVoiceCoordinator.shouldDestroyArticleConnection(guildId),
+        shouldDestroyConnection,
     );
     await interaction.reply({
         content: '🧹 現在の録音・選択中キャッシュを破棄しました。保存済み音声ファイル自体は残ります。',

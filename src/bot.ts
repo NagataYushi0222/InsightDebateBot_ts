@@ -6,6 +6,7 @@ import {
     Routes,
     Events,
     MessageFlags,
+    TextChannel,
     VoiceBasedChannel,
 } from 'discord.js';
 import {
@@ -18,6 +19,7 @@ import { DISCORD_TOKEN } from './config';
 import { initDb } from './database';
 import { SessionManager } from './sessionManager';
 import { LiveVoiceStatusDisplay } from './liveVoiceStatusDisplay';
+import { VoiceDisconnectReporter } from './voiceDisconnectReporter';
 import { buildBotCommands } from './commands/builders';
 import { AnalyzeModeEnvironment } from './commands/analyzeModes';
 import {
@@ -42,6 +44,7 @@ const client = new Client({
 
 const sessionManager = new SessionManager(client);
 const liveVoiceStatusDisplay = new LiveVoiceStatusDisplay(client, sessionManager);
+const voiceDisconnectReporter = new VoiceDisconnectReporter(client, sessionManager, liveVoiceStatusDisplay);
 sessionManager.setStatusAnchorHandler((guildId, message) => liveVoiceStatusDisplay.bindMessage(guildId, message));
 
 const analyzeModeEnvironment: AnalyzeModeEnvironment = {
@@ -63,17 +66,30 @@ const analyzeModeEnvironment: AnalyzeModeEnvironment = {
                 try {
                     console.log('[Voice] Disconnected. Attempting to reconnect...');
                     entersState(connection, VoiceConnectionStatus.Connecting, 5_000)
-                        .catch(() => {
+                        .catch(async () => {
                             console.log('[Voice] Reconnect failed. Destroying connection.');
-                            connection.destroy();
+                            await voiceDisconnectReporter.reportBeforeDestroy({
+                                guildId,
+                                connection,
+                                reason: 'Discord の音声接続が切断され、5秒以内に再接続できなかったため',
+                            });
                         });
                 } catch {
-                    connection.destroy();
+                    void voiceDisconnectReporter.reportBeforeDestroy({
+                        guildId,
+                        connection,
+                        reason: 'Discord の音声接続が切断され、再接続処理を開始できなかったため',
+                    });
                 }
             }
 
             if (newState.status === VoiceConnectionStatus.Destroyed) {
                 console.log('[Voice] Connection destroyed. Cleaning up stale session state.');
+                void voiceDisconnectReporter.report({
+                    guildId,
+                    connection,
+                    reason: '音声接続が破棄されたため',
+                });
                 sessionManager.cleanupDestroyedConnection(guildId, connection);
             }
 
@@ -88,10 +104,22 @@ const analyzeModeEnvironment: AnalyzeModeEnvironment = {
             console.log(`[Voice Debug] ${message}`);
         });
 
-        await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+        try {
+            await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+        } catch (error) {
+            await voiceDisconnectReporter.reportBeforeDestroy({
+                guildId,
+                connection,
+                reason: 'VC 接続の開始中に Ready 状態へ到達できなかったため',
+                detail: error instanceof Error ? error.message : String(error),
+                fallbackTextChannel: interaction.channel as TextChannel | null,
+            });
+            throw error;
+        }
         return { connection, reused: false };
     },
     shouldDestroyConnection: () => true,
+    voiceDisconnectReporter,
 };
 
 function seedVoiceParticipants(connection: VoiceConnection, voiceChannel: VoiceBasedChannel): void {
@@ -182,7 +210,25 @@ client.on('interactionCreate', async (interaction) => {
 
 client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
     // 自身のイベントは無視
-    if (oldState.member?.id === client.user?.id) return;
+    if (oldState.member?.id === client.user?.id) {
+        if (oldState.channelId && oldState.channelId !== newState.channelId) {
+            const guildId = oldState.guild.id;
+            const session = sessionManager.getExistingSession(guildId);
+            const connection = session?.voiceConnection || null;
+            if (connection?.joinConfig.channelId === oldState.channelId) {
+                await voiceDisconnectReporter.reportBeforeDestroy({
+                    guildId,
+                    connection,
+                    reason: newState.channelId
+                        ? 'Bot が別の VC へ移動したため'
+                        : 'Bot が VC から退出したため',
+                    detail: 'Discord の VoiceStateUpdate で Bot の在室先変更を検知しました。',
+                    fallbackTextChannel: session?.targetTextChannel || null,
+                });
+            }
+        }
+        return;
+    }
 
     // ユーザーがチャンネルから退出したか確認
     if (oldState.channelId && oldState.channelId !== newState.channelId) {
@@ -205,6 +251,12 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
                     if (textChannel) {
                         await textChannel.send("👋 全員がボイスチャンネルから退出したため、自動的に分析を終了します。");
                     }
+                    await voiceDisconnectReporter.report({
+                        guildId,
+                        connection: session.voiceConnection,
+                        reason: '対象VC内の参加者が全員退出したため',
+                        fallbackTextChannel: textChannel,
+                    });
                     await sessionManager.cleanupSession(guildId, false);
                 }
             }

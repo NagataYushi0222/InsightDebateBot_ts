@@ -19,6 +19,7 @@ import { VcArticleSessionManager } from './vcArticle/sessionManager';
 import { SharedVoiceCoordinator } from './sharedVoiceCoordinator';
 import { RuntimeMonitor } from './runtimeMonitor';
 import { LiveVoiceStatusDisplay } from './liveVoiceStatusDisplay';
+import { VoiceDisconnectReporter } from './voiceDisconnectReporter';
 import { buildBotCommands } from './commands/builders';
 import { AnalyzeModeEnvironment } from './commands/analyzeModes';
 import {
@@ -54,9 +55,20 @@ const client = new Client({
 
 const sessionManager = new SessionManager(client);
 const vcArticleManager = new VcArticleSessionManager(client);
-const sharedVoiceCoordinator = new SharedVoiceCoordinator(client, sessionManager, vcArticleManager);
-const runtimeMonitor = new RuntimeMonitor(client, sessionManager, vcArticleManager, sharedVoiceCoordinator);
 const liveVoiceStatusDisplay = new LiveVoiceStatusDisplay(client, sessionManager, vcArticleManager);
+const voiceDisconnectReporter = new VoiceDisconnectReporter(
+    client,
+    sessionManager,
+    liveVoiceStatusDisplay,
+    vcArticleManager,
+);
+const sharedVoiceCoordinator = new SharedVoiceCoordinator(
+    client,
+    sessionManager,
+    vcArticleManager,
+    (event) => voiceDisconnectReporter.report(event),
+);
+const runtimeMonitor = new RuntimeMonitor(client, sessionManager, vcArticleManager, sharedVoiceCoordinator);
 sessionManager.setStatusAnchorHandler((guildId, message) => liveVoiceStatusDisplay.bindMessage(guildId, message));
 
 const analyzeModeEnvironment: AnalyzeModeEnvironment = {
@@ -70,6 +82,7 @@ const analyzeModeEnvironment: AnalyzeModeEnvironment = {
         )
     ),
     shouldDestroyConnection: (guildId) => sharedVoiceCoordinator.shouldDestroyAnalyzeConnection(guildId),
+    voiceDisconnectReporter,
     logCleanup: (reason, guildId) => runtimeMonitor.logSessionCleanup(reason, guildId),
 };
 const articleEnvironment = {
@@ -77,6 +90,7 @@ const articleEnvironment = {
     sharedVoiceCoordinator,
     runtimeMonitor,
     liveVoiceStatusDisplay,
+    voiceDisconnectReporter,
 };
 const commands = buildBotCommands({
     includeDialogue: true,
@@ -192,6 +206,20 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
             oldState.channelId,
             newState.channelId,
         );
+        if (oldState.channelId && oldState.channelId !== newState.channelId) {
+            const guildId = oldState.guild.id;
+            const connection = sharedVoiceCoordinator.getActiveGuildVoiceConnection(guildId);
+            if (connection?.joinConfig.channelId === oldState.channelId) {
+                await voiceDisconnectReporter.reportBeforeDestroy({
+                    guildId,
+                    connection,
+                    reason: newState.channelId
+                        ? 'Bot が別の VC へ移動したため'
+                        : 'Bot が VC から退出したため',
+                    detail: 'Discord の VoiceStateUpdate で Bot の在室先変更を検知しました。',
+                });
+            }
+        }
         return;
     }
 
@@ -225,6 +253,24 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
 
     if (articleActive && articleSession.targetTextChannel) {
         await articleSession.targetTextChannel.send('👋 全員が退出したため、録音を停止して記事候補を抽出します。');
+    }
+
+    if (analyzeActive && analyzeSession.voiceConnection && !sharedConnection) {
+        await voiceDisconnectReporter.report({
+            guildId,
+            connection: analyzeSession.voiceConnection,
+            reason: '対象VC内の参加者が全員退出したため',
+            fallbackTextChannel: analyzeSession.targetTextChannel,
+        });
+    }
+
+    if (articleActive && articleSession.voiceConnection) {
+        await voiceDisconnectReporter.report({
+            guildId,
+            connection: articleSession.voiceConnection,
+            reason: '対象VC内の参加者が全員退出したため',
+            fallbackTextChannel: articleSession.targetTextChannel,
+        });
     }
 
     if (analyzeActive) {
