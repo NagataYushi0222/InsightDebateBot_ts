@@ -8,6 +8,9 @@ const STATUS_UPDATE_INTERVAL_MS = 10_000;
 const MAX_STATUS_MESSAGE_LENGTH = 1_900;
 const MAX_INLINE_TEXT_LENGTH = 80;
 const MAX_SPEAKER_LINES = 3;
+const DAVE_WARNING_RATE = 0.05;
+const OPUS_WARNING_RATE = 0.02;
+const MIN_PACKETS_FOR_QUALITY_WARNING = 50;
 
 interface TrackedStatusMessage {
     anchorMessage: Message;
@@ -22,6 +25,10 @@ interface AnalyzeStatusSummary {
     remainingSeconds: number | null;
     mode: string;
     dialogueTheme: string | null;
+    retainedAudioSegmentCount: number;
+    retainedAudioUserCount: number;
+    retainedAudioIncludedInCurrentReport: boolean;
+    retainedAudioIncludedSegmentCount: number;
 }
 
 interface ArticleStatusSummary {
@@ -39,6 +46,11 @@ interface RenderedStatusPayload {
     keepTracking: boolean;
 }
 
+interface QualitySummary {
+    line: string;
+    hasWarning: boolean;
+}
+
 function formatRate(numerator: number, denominator: number): string {
     if (denominator <= 0) {
         return '0.00%';
@@ -47,11 +59,12 @@ function formatRate(numerator: number, denominator: number): string {
     return `${((numerator / denominator) * 100).toFixed(2)}%`;
 }
 
-function formatBytes(bytes: number): string {
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+function rateValue(numerator: number, denominator: number): number {
+    if (denominator <= 0) {
+        return 0;
+    }
+
+    return numerator / denominator;
 }
 
 function formatRemaining(seconds: number | null): string {
@@ -287,6 +300,10 @@ export class LiveVoiceStatusDisplay {
             remainingSeconds: null,
             mode: 'debate',
             dialogueTheme: null,
+            retainedAudioSegmentCount: 0,
+            retainedAudioUserCount: 0,
+            retainedAudioIncludedInCurrentReport: false,
+            retainedAudioIncludedSegmentCount: 0,
         };
         const articleSummary: ArticleStatusSummary | null = articleSession?.getStatusSummary() || null;
         const connection = this.resolveVoiceConnection(guildId);
@@ -310,25 +327,23 @@ export class LiveVoiceStatusDisplay {
             botPresent,
         });
 
+        const qualitySummary = this.buildQualitySummary(liveSnapshot);
         const lines = [
-            '📡 **VC稼働モニター**',
-            this.buildUpdateLine(keepTracking),
-            `対象VC: **${truncateText(String(targetChannelName), 60)}**`,
-            `接続状態: \`${connectionStatus}\` / Bot在室: \`${botPresent ? 'yes' : 'no'}\` / BotのVC: \`${botVoiceChannelId || 'none'}\``,
-            `観測話者数: \`${liveSnapshot?.totals.userCount || 0}\``,
-            '',
-            '**分析モード**',
-            `状態: \`${analyzeSummary.status}\``,
-            `モード: \`${analyzeSummary.mode}\``,
+            `📡 **VC稼働モニター** \`${formatTime(new Date())}\` / 自動更新: \`${keepTracking ? 'ON' : 'OFF'}\``,
+            `VC: **${truncateText(String(targetChannelName), 46)}** / 接続: \`${connectionStatus}\` / Bot: \`${botPresent ? 'yes' : 'no'}\` / 話者: \`${liveSnapshot?.totals.userCount || 0}\``,
+            `分析: \`${analyzeSummary.status}\` / \`${analyzeSummary.mode}\` / 次回: \`${formatRemaining(analyzeSummary.remainingSeconds)}\``,
+            `処理: ${truncateText(analyzeSummary.task, 96)}`,
             ...(analyzeSummary.dialogueTheme
-                ? [`対話テーマ: ${truncateText(analyzeSummary.dialogueTheme, 120)}`]
+                ? [`対話テーマ: ${truncateText(analyzeSummary.dialogueTheme, 96)}`]
                 : []),
-            `処理: ${truncateText(analyzeSummary.task, 120)}`,
-            `次回レポートまで: \`${formatRemaining(analyzeSummary.remainingSeconds)}\``,
-            '',
-            ...(articleSummary ? this.buildArticleSection(articleSummary) : []),
-            ...this.buildPacketSection(guildId, liveSnapshot),
-            ...this.buildSpeakerSection(guild, liveSnapshot),
+            `繰り越し音声: ${this.buildRetainedAudioLabel(analyzeSummary)}`,
+            ...(articleSummary && this.shouldShowArticleSection(articleSummary)
+                ? [this.buildArticleLine(articleSummary)]
+                : []),
+            qualitySummary.line,
+            ...(qualitySummary.hasWarning
+                ? this.buildSpeakerSection(guild, liveSnapshot)
+                : []),
         ];
 
         return {
@@ -337,50 +352,68 @@ export class LiveVoiceStatusDisplay {
         };
     }
 
-    private buildArticleSection(articleSummary: ArticleStatusSummary): string[] {
-        return [
-            '**記事モード**',
-            `状態: \`${articleSummary.status}\``,
-            `処理: ${truncateText(articleSummary.task, 120)}`,
-            `録音断片: \`${articleSummary.pendingClipCount}\` / 参考チャット: \`${articleSummary.textEntryCount}\` / 候補トピック: \`${articleSummary.topicCount}\``,
-            `選択中アーカイブ: \`${articleSummary.activeArchiveId || 'none'}\``,
-            `選択中タイトル: ${truncateText(articleSummary.activeArchiveLabel || 'なし', 100)}`,
-            '',
-        ];
+    private buildRetainedAudioLabel(analyzeSummary: AnalyzeStatusSummary): string {
+        if (analyzeSummary.retainedAudioIncludedInCurrentReport) {
+            return `\`今回投入中 ${analyzeSummary.retainedAudioIncludedSegmentCount}件\``;
+        }
+
+        if (analyzeSummary.retainedAudioSegmentCount > 0) {
+            return `\`保持中 ${analyzeSummary.retainedAudioSegmentCount}件 / ${analyzeSummary.retainedAudioUserCount}人\` 次回レポートに含めます`;
+        }
+
+        return '`なし`';
     }
 
-    private buildPacketSection(
-        guildId: string,
-        liveSnapshot: VoiceConnectionLiveSnapshot | null,
-    ): string[] {
+    private shouldShowArticleSection(articleSummary: ArticleStatusSummary): boolean {
+        return articleSummary.status !== '停止中'
+            || articleSummary.pendingClipCount > 0
+            || articleSummary.textEntryCount > 0
+            || articleSummary.topicCount > 0
+            || !!articleSummary.activeArchiveId;
+    }
+
+    private buildArticleLine(articleSummary: ArticleStatusSummary): string {
+        const archiveLabel = articleSummary.activeArchiveLabel || articleSummary.activeArchiveId;
+        return [
+            `記事: \`${articleSummary.status}\``,
+            `断片 \`${articleSummary.pendingClipCount}\``,
+            `チャット \`${articleSummary.textEntryCount}\``,
+            `候補 \`${articleSummary.topicCount}\``,
+            ...(archiveLabel ? [`選択中 ${truncateText(archiveLabel, 42)}`] : []),
+        ].join(' / ');
+    }
+
+    private buildQualitySummary(liveSnapshot: VoiceConnectionLiveSnapshot | null): QualitySummary {
         if (!liveSnapshot) {
-            return [
-                '**受信統計**',
-                '接続がないため、現在のパケット統計はありません。',
-                '',
-            ];
+            return {
+                line: 'DAVE受信: `0` / 音声品質: `待機中`',
+                hasWarning: false,
+            };
         }
 
         const totals = liveSnapshot.totals;
         const daveTotal = totals.daveDecryptSuccesses + totals.daveDecryptFailures;
-        const analyzeConsumer = totals.pcmByConsumer[`analyze:${guildId}`] || {
-            pcmPacketsDelivered: 0,
-            pcmBytesDelivered: 0,
-        };
-        const articleConsumer = totals.pcmByConsumer[`article:${guildId}`] || {
-            pcmPacketsDelivered: 0,
-            pcmBytesDelivered: 0,
-        };
+        const daveFailureRate = rateValue(totals.daveDecryptFailures, daveTotal);
+        const opusFailureRate = rateValue(totals.opusDecodeFailures, totals.opusPacketsReceived);
+        const hasWarning = (
+            daveTotal >= MIN_PACKETS_FOR_QUALITY_WARNING
+            && daveFailureRate >= DAVE_WARNING_RATE
+        ) || (
+            totals.opusPacketsReceived >= MIN_PACKETS_FOR_QUALITY_WARNING
+            && opusFailureRate >= OPUS_WARNING_RATE
+        );
 
-        return [
-            '**受信統計**',
-            `Opus受信: \`${totals.opusPacketsReceived}\``,
-            `DAVE復号: 成功 \`${totals.daveDecryptSuccesses}\` / 失敗 \`${totals.daveDecryptFailures}\` / 失敗率 \`${formatRate(totals.daveDecryptFailures, daveTotal)}\``,
-            `Opusデコード失敗: \`${totals.opusDecodeFailures}\` / 失敗率 \`${formatRate(totals.opusDecodeFailures, totals.opusPacketsReceived)}\``,
-            `PCM配信(要約): \`${analyzeConsumer.pcmPacketsDelivered}\` packets / \`${formatBytes(analyzeConsumer.pcmBytesDelivered)}\``,
-            `PCM配信(記事): \`${articleConsumer.pcmPacketsDelivered}\` packets / \`${formatBytes(articleConsumer.pcmBytesDelivered)}\``,
-            '',
-        ];
+        return {
+            line: [
+                `DAVE受信: \`${daveTotal}\``,
+                `成功 \`${totals.daveDecryptSuccesses}\``,
+                `失敗 \`${totals.daveDecryptFailures}\``,
+                `失敗率 \`${formatRate(totals.daveDecryptFailures, daveTotal)}\``,
+                `Opus失敗率 \`${formatRate(totals.opusDecodeFailures, totals.opusPacketsReceived)}\``,
+                `音声品質: \`${hasWarning ? '注意' : 'OK'}\``,
+            ].join(' / '),
+            hasWarning,
+        };
     }
 
     private buildSpeakerSection(
@@ -406,7 +439,7 @@ export class LiveVoiceStatusDisplay {
             })
             .slice(0, MAX_SPEAKER_LINES);
 
-        const lines = ['**話者別の状況**'];
+        const lines = ['**音声品質の注意話者**'];
 
         for (const user of worstUsers) {
             lines.push(this.formatUserLine(guild, user));

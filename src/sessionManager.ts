@@ -2,11 +2,13 @@ import {
     VoiceConnection,
     VoiceConnectionStatus,
 } from '@ovencord/voice';
+import fs from 'fs';
+import path from 'path';
 import { Client, TextChannel, Guild, Message } from 'discord.js';
 import { UserAudioRecorder } from './recorder';
 import { convertToMp3, cleanupFiles } from './audioProcessor';
 import { analyzeDiscussion, StructuredDiscussionMemory } from './analyzer';
-import { getGeminiModelDisplayName, resolveGeminiModel } from './config';
+import { getGeminiModelDisplayName, resolveGeminiModel, TEMP_AUDIO_DIR } from './config';
 import { getGuildSettings, GuildSettings } from './database';
 import { attachVoiceCaptureConsumer } from './voiceCaptureHub';
 import type { VoiceConsumerDiagnosticsSnapshot } from './voiceDiagnostics';
@@ -26,6 +28,19 @@ export interface AnalyzeStatusSummary {
     remainingSeconds: number | null;
     mode: string;
     dialogueTheme: string | null;
+    retainedAudioSegmentCount: number;
+    retainedAudioUserCount: number;
+    retainedAudioIncludedInCurrentReport: boolean;
+    retainedAudioIncludedSegmentCount: number;
+}
+
+interface PreparedAudioBatch {
+    analysisRawFiles: Map<string, string>;
+    sourceRawFilesByUser: Map<string, string[]>;
+    sourceRawFiles: string[];
+    generatedRawFiles: string[];
+    hadRetainedAudio: boolean;
+    retainedSegmentCount: number;
 }
 
 /**
@@ -60,6 +75,9 @@ export class GuildSession {
     private statusAnchorHandler: StatusAnchorHandler | null = null;
     private activeAnalysisMode: string = 'debate';
     private activeDialogueTheme: string | null = null;
+    private retainedRawAudioFiles: Map<string, string[]> = new Map();
+    private retainedAudioIncludedInCurrentReport: boolean = false;
+    private retainedAudioIncludedSegmentCount: number = 0;
 
     constructor(guildId: string, bot: Client) {
         this.guildId = guildId;
@@ -144,6 +162,28 @@ export class GuildSession {
         return this.isStopping;
     }
 
+    hasRetainedAudio(): boolean {
+        return this.getRetainedAudioSegmentCount() > 0;
+    }
+
+    adoptRetainedRawAudioFiles(retainedRawAudioFiles: Map<string, string[]>): void {
+        this.discardRetainedRawAudioFiles();
+        this.retainedRawAudioFiles = new Map(
+            Array.from(retainedRawAudioFiles.entries())
+                .map(([userId, files]) => [
+                    userId,
+                    files.filter((filePath) => fs.existsSync(filePath)),
+                ] as [string, string[]])
+                .filter(([, files]) => files.length > 0),
+        );
+    }
+
+    takeRetainedRawAudioFiles(): Map<string, string[]> {
+        const retained = this.retainedRawAudioFiles;
+        this.retainedRawAudioFiles = new Map();
+        return retained;
+    }
+
     handleDestroyedConnection(connection: VoiceConnection): boolean {
         if (this.voiceConnection !== connection) return false;
 
@@ -158,6 +198,9 @@ export class GuildSession {
         this.recorder = null;
         this.processingPromise = null;
         this.activeDialogueTheme = null;
+        this.discardRetainedRawAudioFiles();
+        this.retainedAudioIncludedInCurrentReport = false;
+        this.retainedAudioIncludedSegmentCount = 0;
         this.currentStatus = '切断済み';
         this.currentTaskLabel = '接続が破棄されました';
         this.cycleStartedAt = null;
@@ -207,6 +250,10 @@ export class GuildSession {
                 await this.processAudio(false, true);
             }
 
+            if (skipFinal) {
+                this.discardRetainedRawAudioFiles();
+            }
+
             this.isProcessingAudio = false;
             this.cycleStartedAt = null;
             this.currentStatus = '停止中';
@@ -233,6 +280,10 @@ export class GuildSession {
             remainingSeconds: this.getRemainingSeconds(),
             mode: this.activeAnalysisMode,
             dialogueTheme: this.activeDialogueTheme,
+            retainedAudioSegmentCount: this.getRetainedAudioSegmentCount(),
+            retainedAudioUserCount: this.retainedRawAudioFiles.size,
+            retainedAudioIncludedInCurrentReport: this.retainedAudioIncludedInCurrentReport,
+            retainedAudioIncludedSegmentCount: this.retainedAudioIncludedSegmentCount,
         };
     }
 
@@ -295,6 +346,136 @@ export class GuildSession {
         }
     }
 
+    private getRetainedAudioSegmentCount(): number {
+        let count = 0;
+        for (const files of this.retainedRawAudioFiles.values()) {
+            count += files.length;
+        }
+        return count;
+    }
+
+    private discardRetainedRawAudioFiles(): void {
+        const retainedFiles = Array.from(this.retainedRawAudioFiles.values()).flat();
+        cleanupFiles(retainedFiles);
+        this.retainedRawAudioFiles.clear();
+    }
+
+    private retainRawAudioFiles(sourceRawFilesByUser: Map<string, string[]>): void {
+        this.retainedRawAudioFiles = new Map(
+            Array.from(sourceRawFilesByUser.entries())
+                .map(([userId, files]) => [
+                    userId,
+                    files.filter((filePath) => fs.existsSync(filePath)),
+                ] as [string, string[]])
+                .filter(([, files]) => files.length > 0),
+        );
+    }
+
+    private clearRetainedRawAudioReferences(): void {
+        this.retainedRawAudioFiles.clear();
+    }
+
+    private resetRetainedAudioProcessingMarker(): void {
+        this.retainedAudioIncludedInCurrentReport = false;
+        this.retainedAudioIncludedSegmentCount = 0;
+    }
+
+    private async concatenateRawAudioFiles(filePaths: string[], outputPath: string): Promise<void> {
+        await new Promise<void>((resolve, reject) => {
+            const output = fs.createWriteStream(outputPath);
+            let settled = false;
+            let index = 0;
+
+            const fail = (error: unknown) => {
+                if (settled) return;
+                settled = true;
+                output.destroy();
+                reject(error);
+            };
+
+            const pipeNext = () => {
+                if (settled) return;
+                if (index >= filePaths.length) {
+                    output.end();
+                    return;
+                }
+
+                const input = fs.createReadStream(filePaths[index++]);
+                input.once('error', fail);
+                input.once('end', pipeNext);
+                input.pipe(output, { end: false });
+            };
+
+            output.once('error', fail);
+            output.once('finish', () => {
+                if (settled) return;
+                settled = true;
+                resolve();
+            });
+
+            pipeNext();
+        });
+    }
+
+    private buildSourceRawFilesByUser(currentRawFiles: Map<string, string>): Map<string, string[]> {
+        const sourceRawFilesByUser = new Map<string, string[]>();
+
+        const appendRawFile = (userId: string, filePath: string) => {
+            if (!fs.existsSync(filePath) || fs.statSync(filePath).size === 0) {
+                return;
+            }
+            const files = sourceRawFilesByUser.get(userId) || [];
+            if (!files.includes(filePath)) {
+                files.push(filePath);
+            }
+            sourceRawFilesByUser.set(userId, files);
+        };
+
+        for (const [userId, files] of this.retainedRawAudioFiles.entries()) {
+            for (const filePath of files) {
+                appendRawFile(userId, filePath);
+            }
+        }
+
+        for (const [userId, filePath] of currentRawFiles.entries()) {
+            appendRawFile(userId, filePath);
+        }
+
+        return sourceRawFilesByUser;
+    }
+
+    private async prepareAudioBatch(currentRawFiles: Map<string, string>): Promise<PreparedAudioBatch> {
+        const sourceRawFilesByUser = this.buildSourceRawFilesByUser(currentRawFiles);
+        const retainedSegmentCount = this.getRetainedAudioSegmentCount();
+
+        const analysisRawFiles = new Map<string, string>();
+        const generatedRawFiles: string[] = [];
+
+        for (const [userId, files] of sourceRawFilesByUser.entries()) {
+            if (files.length === 1) {
+                analysisRawFiles.set(userId, files[0]);
+                continue;
+            }
+
+            const combinedPath = path.join(
+                TEMP_AUDIO_DIR,
+                `combined_${this.guildId}_${userId}_${Date.now()}_${Math.random().toString(36).slice(2)}.pcm`,
+            );
+            await this.concatenateRawAudioFiles(files, combinedPath);
+            generatedRawFiles.push(combinedPath);
+            analysisRawFiles.set(userId, combinedPath);
+        }
+
+        return {
+            analysisRawFiles,
+            sourceRawFilesByUser,
+            sourceRawFiles: Array.from(sourceRawFilesByUser.values()).flat(),
+            generatedRawFiles,
+            hadRetainedAudio: retainedSegmentCount > 0,
+            retainedSegmentCount,
+        };
+    }
+
     /**
      * 蓄積された音声を分析する
      */
@@ -326,6 +507,7 @@ export class GuildSession {
 
         const jobName = isManual ? 'Manual analysis' : 'Periodic analysis';
         console.log(`[${this.guildId}] Starting ${jobName}...`);
+        let latestRawFilesForRetention: Map<string, string> | null = null;
 
         try {
             this.currentStatus = isFinal ? '最終分析中' : isManual ? '手動分析中' : '自動分析中';
@@ -333,8 +515,9 @@ export class GuildSession {
             await this.refreshStatusMessage(undefined, true);
 
             const userFilesRaw = await recorder.flushAudio();
+            latestRawFilesForRetention = userFilesRaw;
 
-            if (userFilesRaw.size === 0) {
+            if (userFilesRaw.size === 0 && !this.hasRetainedAudio()) {
                 if (isFinal || !this.isRecording) {
                     this.currentStatus = '停止中';
                     this.currentTaskLabel = '録音は停止しています';
@@ -344,6 +527,22 @@ export class GuildSession {
                     this.currentTaskLabel = isManual ? '新しい音声がなかったため待機中' : '次回の自動分析を待機中';
                     await this.refreshStatusMessage(undefined, true);
                 }
+                return;
+            }
+
+            const audioBatch = await this.prepareAudioBatch(userFilesRaw);
+            this.retainedAudioIncludedInCurrentReport = audioBatch.hadRetainedAudio;
+            this.retainedAudioIncludedSegmentCount = audioBatch.retainedSegmentCount;
+
+            if (audioBatch.hadRetainedAudio) {
+                console.log(
+                    `[${this.guildId}] Including ${audioBatch.retainedSegmentCount} retained audio segment(s) in this report.`,
+                );
+            }
+
+            if (audioBatch.analysisRawFiles.size === 0) {
+                this.retainRawAudioFiles(audioBatch.sourceRawFilesByUser);
+                cleanupFiles(audioBatch.generatedRawFiles);
                 return;
             }
 
@@ -357,7 +556,7 @@ export class GuildSession {
                 // ignore
             }
 
-            for (const userId of userFilesRaw.keys()) {
+            for (const userId of audioBatch.analysisRawFiles.keys()) {
                 let displayName = `User_${userId}`;
 
                 if (guild) {
@@ -384,11 +583,14 @@ export class GuildSession {
 
             // PCM → MP3 変換
             const userFilesMp3 = new Map<string, string>();
-            const filesToCleanup: string[] = Array.from(userFilesRaw.values());
-            this.currentTaskLabel = 'エンコード中';
+            const filesToCleanup: string[] = [...audioBatch.generatedRawFiles];
+            let reportPosted = false;
+            this.currentTaskLabel = audioBatch.hadRetainedAudio
+                ? `前回未出力の音声 ${audioBatch.retainedSegmentCount} 件を含めてエンコード中`
+                : 'エンコード中';
             await this.refreshStatusMessage(undefined, true);
 
-            for (const [userId, rawPath] of userFilesRaw.entries()) {
+            for (const [userId, rawPath] of audioBatch.analysisRawFiles.entries()) {
                 const mp3Path = convertToMp3(rawPath);
                 if (mp3Path) {
                     userFilesMp3.set(userId, mp3Path);
@@ -396,8 +598,12 @@ export class GuildSession {
                 }
             }
 
-            if (userFilesMp3.size === 0) {
+            if (userFilesMp3.size !== audioBatch.analysisRawFiles.size) {
+                this.retainRawAudioFiles(audioBatch.sourceRawFilesByUser);
                 cleanupFiles(filesToCleanup);
+                if (this.targetTextChannel) {
+                    await this.targetTextChannel.send('⚠️ 音声ファイルの一部をエンコードできなかったため、今回の音声は次回レポートへ繰り越します。');
+                }
                 return;
             }
 
@@ -461,8 +667,6 @@ export class GuildSession {
                     return;
                 }
 
-                // 次回用の文脈は自然文レポートではなく、構造化メモとして保持する。
-                this.structuredMemory = analysisResult.memory;
                 this.currentTaskLabel = 'レポート投稿中';
                 await this.refreshStatusMessage(undefined, true);
 
@@ -506,7 +710,10 @@ export class GuildSession {
                 });
 
                 // レポートを投稿
-                const header = `${headerPrefix}\n🤖 **使用モデル**: ${usedModelDisplayName} (\`${usedModelName}\`)\n\n`;
+                const carryOverHeader = audioBatch.hadRetainedAudio
+                    ? `🔁 **繰り越し音声**: 前回未出力の音声 ${audioBatch.retainedSegmentCount} 件を含めています\n`
+                    : '';
+                const header = `${headerPrefix}\n🤖 **使用モデル**: ${usedModelDisplayName} (\`${usedModelName}\`)\n${carryOverHeader}\n`;
                 if (report.length + header.length < 2000) {
                     await reportThread.send(header + report);
                 } else {
@@ -515,6 +722,10 @@ export class GuildSession {
                         await reportThread.send(report.slice(i, i + 1900));
                     }
                 }
+
+                // 次回用の文脈は、Discord へレポートを出せたあとでだけ更新する。
+                this.structuredMemory = analysisResult.memory;
+                reportPosted = true;
             } catch (e) {
                 console.error(`[${this.guildId}] Error in reporting:`, e);
                 if (this.targetTextChannel) {
@@ -522,15 +733,31 @@ export class GuildSession {
                 }
             } finally {
                 cleanupFiles(filesToCleanup);
+                if (reportPosted) {
+                    cleanupFiles(audioBatch.sourceRawFiles);
+                    this.clearRetainedRawAudioReferences();
+                } else {
+                    this.retainRawAudioFiles(audioBatch.sourceRawFilesByUser);
+                    if (this.targetTextChannel) {
+                        await this.targetTextChannel.send('🔁 レポートを出力できなかった音声を保持しました。次回のレポート生成時に一緒に分析します。');
+                    }
+                }
             }
         } catch (e) {
+            if (latestRawFilesForRetention) {
+                this.retainRawAudioFiles(this.buildSourceRawFilesByUser(latestRawFilesForRetention));
+            }
             console.error(`[${this.guildId}] Error in processAudio:`, e);
             if (this.targetTextChannel) {
                 const errorMessage = e instanceof Error ? e.message : String(e);
                 await this.targetTextChannel.send(`⚠️ 分析処理中にエラーが発生しました: ${errorMessage}`);
+                if (this.hasRetainedAudio()) {
+                    await this.targetTextChannel.send('🔁 レポートを出力できなかった音声を保持しました。次回のレポート生成時に一緒に分析します。');
+                }
             }
         } finally {
             this.isProcessingAudio = false;
+            this.resetRetainedAudioProcessingMarker();
 
             if (this.isRecording && this.isProcessLoopRunning) {
                 this.currentStatus = '録音中';
@@ -635,6 +862,7 @@ export class GuildSession {
 export class SessionManager {
     private bot: Client;
     private sessions: Map<string, GuildSession> = new Map();
+    private retainedRawAudioByGuild: Map<string, Map<string, string[]>> = new Map();
     private statusAnchorHandler: StatusAnchorHandler | null = null;
 
     constructor(bot: Client) {
@@ -645,6 +873,11 @@ export class SessionManager {
         if (!this.sessions.has(guildId)) {
             const session = new GuildSession(guildId, this.bot);
             session.setStatusAnchorHandler(this.statusAnchorHandler);
+            const retainedRawAudioFiles = this.retainedRawAudioByGuild.get(guildId);
+            if (retainedRawAudioFiles) {
+                session.adoptRetainedRawAudioFiles(retainedRawAudioFiles);
+                this.retainedRawAudioByGuild.delete(guildId);
+            }
             this.sessions.set(guildId, session);
         }
         return this.sessions.get(guildId)!;
@@ -671,7 +904,13 @@ export class SessionManager {
         destroyConnection: boolean = true
     ): Promise<void> {
         if (this.sessions.has(guildId)) {
-            await this.sessions.get(guildId)!.stopRecording(skipFinal, destroyConnection);
+            const session = this.sessions.get(guildId)!;
+            await session.stopRecording(skipFinal, destroyConnection);
+            if (session.hasRetainedAudio()) {
+                this.retainedRawAudioByGuild.set(guildId, session.takeRetainedRawAudioFiles());
+            } else {
+                this.retainedRawAudioByGuild.delete(guildId);
+            }
             this.sessions.delete(guildId);
         }
     }

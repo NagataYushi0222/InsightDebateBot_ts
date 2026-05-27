@@ -42,6 +42,11 @@ export function buildAnalyzeCheckMessage(params: {
     const remainingLabel = liveStatus.remainingSeconds === null
         ? '停止中'
         : `${Math.floor(liveStatus.remainingSeconds / 60)}分${liveStatus.remainingSeconds % 60}秒`;
+    const retainedAudioLabel = liveStatus.retainedAudioIncludedInCurrentReport
+        ? `今回投入中 ${liveStatus.retainedAudioIncludedSegmentCount}件`
+        : liveStatus.retainedAudioSegmentCount > 0
+            ? `保持中 ${liveStatus.retainedAudioSegmentCount}件 / ${liveStatus.retainedAudioUserCount}人（次回レポートに含めます）`
+            : 'なし';
     const statusEmoji = session.isRecording ? '🔴' : session.isStoppingInProgress() ? '🟡' : '⏹️';
 
     return [
@@ -61,6 +66,7 @@ export function buildAnalyzeCheckMessage(params: {
         `📡 **分析Bot状態**: ${statusEmoji} ${liveStatus.status}`,
         `🛠️ **分析Bot処理**: ${liveStatus.task}`,
         `⏳ **次回レポートまで**: ${remainingLabel}`,
+        `🔁 **繰り越し音声**: ${retainedAudioLabel}`,
         ...extraLines,
         '━━━━━━━━━━━━━━━━━━━━━━',
     ].join('\n');
