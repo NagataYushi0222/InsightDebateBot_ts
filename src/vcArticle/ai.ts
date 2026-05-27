@@ -131,7 +131,7 @@ function normalizeTopicExtractionError(error: unknown): Error {
 
 function shouldRetryTopicExtraction(error: unknown): boolean {
     const message = error instanceof Error ? error.message : String(error);
-    return /timeout|timed out|UNAVAILABLE|high demand|search_web が呼ばれませんでした/i.test(message);
+    return /timeout|timed out|UNAVAILABLE|high demand|search_web が呼ばれませんでした|検索関数の.*上限/i.test(message);
 }
 
 async function uploadToGemini(

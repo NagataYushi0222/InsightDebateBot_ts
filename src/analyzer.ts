@@ -65,6 +65,9 @@ function normalizeAnalysisError(error: unknown): string {
     if (/503|UNAVAILABLE|high demand/i.test(message)) {
         return '⚠️ Gemini が混雑しています。少し時間を置いて再試行してください。';
     }
+    if (/検索関数の.*上限/i.test(message)) {
+        return '⚠️ Web 検索を何度か試しましたが、有効な検索結果を十分に取得できませんでした。話題を少し絞るか、時間を置いて再試行してください。';
+    }
 
     return `分析中にエラーが発生しました: ${message}`;
 }

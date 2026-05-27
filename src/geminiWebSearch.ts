@@ -63,7 +63,7 @@ export async function generateContentWithWebSearch(
     const {
         responseMimeType,
         isThinkingModel = false,
-        maxSteps = 4,
+        maxSteps = 6,
         forceSearch = true,
     } = options;
 
@@ -185,5 +185,39 @@ export async function generateContentWithWebSearch(
         });
     }
 
-    throw new Error('検索関数の呼び出し回数が上限に達しました。');
+    if (searchTrace.length > 0) {
+        contents.push({
+            role: 'user',
+            parts: [{
+                text: [
+                    '検索関数の追加呼び出し上限に達しました。',
+                    'これ以上 search_web を呼ばず、これまでに返された検索結果と参考番号だけを使って最終回答を作成してください。',
+                    '十分に確認できない内容は、未確認または追加確認が必要と明記してください。',
+                ].join('\n'),
+            }],
+        });
+
+        const finalConfig: any = {};
+        if (responseMimeType) {
+            finalConfig.responseMimeType = responseMimeType;
+        }
+        if (isThinkingModel) {
+            finalConfig.thinkingConfig = {
+                thinkingLevel: 'HIGH' as any,
+            };
+        }
+
+        const response = await ai.models.generateContent({
+            model,
+            contents,
+            config: finalConfig,
+        });
+
+        return {
+            response,
+            searchTrace,
+        };
+    }
+
+    throw new Error('検索関数の追加呼び出し上限に達しましたが、有効な検索結果を取得できませんでした。');
 }
