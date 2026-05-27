@@ -11,10 +11,37 @@ export const SAMPLE_RATE = 48000;
 export const CHANNELS = 2;
 
 // Models
-export const GEMINI_MODEL_FLASH = 'gemini-2.5-flash';
-export const GEMINI_MODEL_3_FLASH = 'gemini-3-flash-preview';
-export const GEMINI_MODEL_31_FLASH_LITE = 'gemini-3.1-flash-lite-preview';
-export const DEFAULT_MODEL = GEMINI_MODEL_3_FLASH;
+export const GEMINI_MODEL_35_FLASH = 'gemini-3.5-flash';
+export const GEMINI_MODEL_31_FLASH_LITE = 'gemini-3.1-flash-lite';
+export const DEFAULT_MODEL = GEMINI_MODEL_35_FLASH;
+
+export const DEPRECATED_MODEL_REPLACEMENTS: Record<string, string> = {
+    'gemini-2.5-flash': GEMINI_MODEL_35_FLASH,
+    'gemini-3-flash-preview': GEMINI_MODEL_35_FLASH,
+    'gemini-3.1-flash-lite-preview': GEMINI_MODEL_31_FLASH_LITE,
+    'gemini-2.5-flash-lite': GEMINI_MODEL_31_FLASH_LITE,
+};
+
+export function resolveGeminiModel(modelName: string | null | undefined): string {
+    const normalized = modelName?.trim();
+    if (!normalized) return DEFAULT_MODEL;
+    return DEPRECATED_MODEL_REPLACEMENTS[normalized] || normalized;
+}
+
+export function getGeminiModelDisplayName(modelId: string): string {
+    switch (modelId) {
+        case GEMINI_MODEL_35_FLASH:
+            return 'Gemini 3.5 Flash';
+        case GEMINI_MODEL_31_FLASH_LITE:
+            return 'Gemini 3.1 Flash Lite';
+        default:
+            return modelId;
+    }
+}
+
+export function isGeminiThinkingModel(modelName: string): boolean {
+    return /^gemini-(?:2\.5|3(?:[.-]|$))/.test(modelName);
+}
 
 // Paths
 export const TEMP_AUDIO_DIR = 'temp_audio';

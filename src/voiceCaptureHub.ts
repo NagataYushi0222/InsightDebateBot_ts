@@ -17,7 +17,7 @@ export interface VoiceCaptureConsumer {
 
 class VoiceCaptureHub {
     private readonly consumers = new Set<VoiceCaptureConsumer>();
-    private readonly activeReaders = new Set<string>();
+    private readonly activeReaders = new Map<string, ReadableStreamDefaultReader<Uint8Array | null>>();
     private readonly decoders = new Map<string, OpusDecoder>();
     private readonly consumerBaselines = new Map<VoiceCaptureConsumer, Map<string, {
         daveDecryptFailures: number;
@@ -81,7 +81,6 @@ class VoiceCaptureHub {
             return;
         }
 
-        this.activeReaders.add(userId);
         const opusStream = this.connection.receiver.subscribe(userId, {
             end: {
                 behavior: EndBehaviorType.Manual,
@@ -98,12 +97,13 @@ class VoiceCaptureHub {
 
         const decoder = this.decoders.get(userId)!;
         const reader = opusStream.stream.getReader();
+        this.activeReaders.set(userId, reader);
 
         const readLoop = async () => {
             try {
-                while (true) {
+                while (!this.isDisposed) {
                     const { done, value } = await reader.read();
-                    if (done || !value) {
+                    if (this.isDisposed || done || !value) {
                         break;
                     }
 
@@ -131,6 +131,11 @@ class VoiceCaptureHub {
                 console.error(`Shared audio stream error for user ${userId}:`, error);
             } finally {
                 this.activeReaders.delete(userId);
+                try {
+                    reader.releaseLock();
+                } catch {
+                    // ignore release errors during shutdown
+                }
                 decoder.destroy();
                 this.decoders.delete(userId);
             }
@@ -150,6 +155,9 @@ class VoiceCaptureHub {
 
         for (const consumer of this.consumers) {
             this.emitConsumerStats(consumer);
+        }
+        for (const reader of this.activeReaders.values()) {
+            reader.cancel().catch(() => undefined);
         }
         for (const decoder of this.decoders.values()) {
             decoder.destroy();

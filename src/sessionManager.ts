@@ -6,6 +6,7 @@ import { Client, TextChannel, Guild, Message } from 'discord.js';
 import { UserAudioRecorder } from './recorder';
 import { convertToMp3, cleanupFiles } from './audioProcessor';
 import { analyzeDiscussion, StructuredDiscussionMemory } from './analyzer';
+import { getGeminiModelDisplayName, resolveGeminiModel } from './config';
 import { getGuildSettings, GuildSettings } from './database';
 import { attachVoiceCaptureConsumer } from './voiceCaptureHub';
 import type { VoiceConsumerDiagnosticsSnapshot } from './voiceDiagnostics';
@@ -439,6 +440,8 @@ export class GuildSession {
                     this.activeDialogueTheme,
                 );
                 const report = analysisResult.report;
+                const usedModelName = analysisResult.modelName || resolveGeminiModel(this.settings.model_name);
+                const usedModelDisplayName = getGeminiModelDisplayName(usedModelName);
 
                 if (!report || report.startsWith("⚠️") || report.startsWith("音声データがありません") || report.startsWith("❌")) {
                     console.log(`[${this.guildId}] Analysis skipped or failed: ${report}`);
@@ -503,7 +506,7 @@ export class GuildSession {
                 });
 
                 // レポートを投稿
-                const header = `${headerPrefix}\n`;
+                const header = `${headerPrefix}\n🤖 **使用モデル**: ${usedModelDisplayName} (\`${usedModelName}\`)\n\n`;
                 if (report.length + header.length < 2000) {
                     await reportThread.send(header + report);
                 } else {

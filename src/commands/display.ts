@@ -1,23 +1,12 @@
 import {
     DEFAULT_MODEL,
-    GEMINI_MODEL_3_FLASH,
-    GEMINI_MODEL_31_FLASH_LITE,
-    GEMINI_MODEL_FLASH,
+    getGeminiModelDisplayName,
 } from '../config';
 import { getGuildSettings } from '../database';
 import { AnalyzeStatusSummary, GuildSession } from '../sessionManager';
 
 export function getModelDisplayName(modelId: string): string {
-    switch (modelId) {
-        case GEMINI_MODEL_FLASH:
-            return 'Gemini 2.5 Flash';
-        case GEMINI_MODEL_3_FLASH:
-            return 'Gemini 3 Flash (Preview)';
-        case GEMINI_MODEL_31_FLASH_LITE:
-            return 'Gemini 3.1 Flash Lite (Preview)';
-        default:
-            return modelId;
-    }
+    return getGeminiModelDisplayName(modelId);
 }
 
 export function getModeDisplayName(mode: string): string {

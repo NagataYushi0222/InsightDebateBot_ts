@@ -3,7 +3,8 @@
  * discord.js の音声受信から来る Opus パケットを PCM に変換する
  */
 export class OpusDecoder {
-    private decoder: any;
+    private decoder: any = null;
+    private destroyed = false;
 
     constructor(sampleRate: number = 48000, channels: number = 2) {
         try {
@@ -20,9 +21,13 @@ export class OpusDecoder {
      * @returns PCM Buffer (signed 16-bit little-endian)
      */
     decode(packet: Buffer): Buffer | null {
+        if (this.destroyed || !this.decoder) {
+            return null;
+        }
+
         try {
             const pcm = this.decoder.decode(packet);
-            return Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+            return Buffer.from(pcm);
         } catch {
             return null;
         }
@@ -32,8 +37,20 @@ export class OpusDecoder {
      * デコーダーを破棄
      */
     destroy(): void {
-        if (this.decoder && typeof this.decoder.delete === 'function') {
-            this.decoder.delete();
+        if (this.destroyed) {
+            return;
+        }
+
+        const decoder = this.decoder;
+        this.destroyed = true;
+        this.decoder = null;
+
+        if (decoder && typeof decoder.delete === 'function') {
+            try {
+                decoder.delete();
+            } catch (error) {
+                console.warn('Failed to destroy OpusScript decoder:', error);
+            }
         }
     }
 }

@@ -1,10 +1,16 @@
 import fs from 'fs';
 import { GoogleGenAI } from '@google/genai';
-import { GEMINI_API_KEY, GEMINI_MODEL_FLASH } from '../config';
+import {
+    GEMINI_API_KEY,
+    isGeminiThinkingModel,
+    resolveGeminiModel,
+} from '../config';
 import { generateContentWithWebSearch } from '../geminiWebSearch';
 import {
+    AUDIO_CLIP_SUMMARY_PROMPT,
     ARTICLE_GENERATION_PROMPT,
     TOPIC_EXTRACTION_FALLBACK_PROMPT,
+    TOPIC_EXTRACTION_FROM_SUMMARIES_PROMPT,
     TOPIC_EXTRACTION_PROMPT,
 } from './prompts';
 import { StoredAudioClip } from './storage';
@@ -15,8 +21,18 @@ const FILE_PROCESSING_TIMEOUT_MS = 180_000;
 const FILE_STATUS_REQUEST_TIMEOUT_MS = 30_000;
 const TOPIC_EXTRACTION_TIMEOUT_MS = 180_000;
 const TOPIC_EXTRACTION_FALLBACK_TIMEOUT_MS = 90_000;
+const CLIP_SUMMARIZATION_TIMEOUT_MS = 60_000;
+const SUMMARY_ONLY_TOPIC_TIMEOUT_MS = 60_000;
 
 export type ArticleProgressReporter = (message: string) => Promise<void> | void;
+
+interface AudioClipDigest {
+    clipId: string;
+    displayName: string;
+    summary: string;
+    notablePoints: string[];
+    hasMeaningfulSpeech: boolean;
+}
 
 // Gemini が ```json``` 付きで返しても JSON として読めるようにする。
 function stripCodeFence(text: string): string {
@@ -44,6 +60,24 @@ function toJsonResult(rawText: string): TopicExtractionResult {
                 includesTextChat: Boolean(topic?.includesTextChat),
             }))
             .slice(0, 5),
+    };
+}
+
+function toAudioClipDigest(rawText: string, clip: StoredAudioClip): AudioClipDigest {
+    const parsed = JSON.parse(stripCodeFence(rawText)) as Partial<AudioClipDigest>;
+    const notablePoints = Array.isArray(parsed.notablePoints)
+        ? parsed.notablePoints.filter((point): point is string => typeof point === 'string').slice(0, 5)
+        : [];
+    const summary = typeof parsed.summary === 'string' ? parsed.summary : '';
+
+    return {
+        clipId: clip.clipId,
+        displayName: clip.displayName,
+        summary,
+        notablePoints,
+        hasMeaningfulSpeech: typeof parsed.hasMeaningfulSpeech === 'boolean'
+            ? parsed.hasMeaningfulSpeech
+            : summary.trim().length > 0 || notablePoints.length > 0,
     };
 }
 
@@ -98,10 +132,6 @@ function normalizeTopicExtractionError(error: unknown): Error {
 function shouldRetryTopicExtraction(error: unknown): boolean {
     const message = error instanceof Error ? error.message : String(error);
     return /timeout|timed out|UNAVAILABLE|high demand|search_web が呼ばれませんでした/i.test(message);
-}
-
-function isThinkingModel(modelName: string): boolean {
-    return modelName.includes('gemini-3.0') || modelName.includes('gemini-3.1');
 }
 
 async function uploadToGemini(
@@ -242,6 +272,122 @@ async function cleanupUploads(ai: GoogleGenAI, uploadedFiles: any[]): Promise<vo
     );
 }
 
+async function summarizeAudioClip(
+    ai: GoogleGenAI,
+    useModel: string,
+    clip: StoredAudioClip,
+    index: number,
+    total: number,
+    onProgress?: ArticleProgressReporter,
+): Promise<AudioClipDigest | null> {
+    if (!fs.existsSync(clip.filePath)) {
+        return null;
+    }
+
+    await reportProgress(
+        onProgress,
+        `🎧 音声断片を順番に要約しています... (${index + 1}/${total})`,
+    );
+
+    const uploadedFile = await uploadToGemini(ai, clip.filePath);
+
+    try {
+        await waitForFilesActive(ai, [uploadedFile], onProgress);
+        const response = await withTimeout(
+            ai.models.generateContent({
+                model: useModel,
+                contents: [
+                    {
+                        role: 'user',
+                        parts: [
+                            { text: AUDIO_CLIP_SUMMARY_PROMPT },
+                            { text: `話者ラベル: ${clip.displayName} / 断片ID: ${clip.clipId}` },
+                            {
+                                fileData: {
+                                    fileUri: uploadedFile.uri,
+                                    mimeType: uploadedFile.mimeType,
+                                },
+                            },
+                        ],
+                    },
+                ],
+                config: {
+                    responseMimeType: 'application/json',
+                } as any,
+            }),
+            CLIP_SUMMARIZATION_TIMEOUT_MS,
+            `音声断片 ${index + 1}/${total} の要約`,
+        );
+        return toAudioClipDigest(response.text || '{}', clip);
+    } catch (error) {
+        console.error(`[VC Article] Failed to summarize clip ${clip.clipId}:`, error);
+        return null;
+    } finally {
+        await cleanupUploads(ai, [uploadedFile]);
+    }
+}
+
+async function extractTopicsFromDigests(
+    ai: GoogleGenAI,
+    useModel: string,
+    digests: AudioClipDigest[],
+    textEntries: TextChatEntry[],
+    onProgress?: ArticleProgressReporter,
+): Promise<TopicExtractionResult> {
+    const meaningfulDigests = digests.filter((digest) => digest.hasMeaningfulSpeech);
+    if (meaningfulDigests.length === 0) {
+        return { sessionSummary: '有効な会話を十分に抽出できませんでした。', topics: [] };
+    }
+
+    await reportProgress(
+        onProgress,
+        '🧩 要約済みの音声断片から記事候補を組み立てています...',
+    );
+
+    const digestText = meaningfulDigests
+        .map((digest, index) => [
+            `断片 ${index + 1}`,
+            `話者: ${digest.displayName}`,
+            `断片ID: ${digest.clipId}`,
+            `要約: ${digest.summary || '要約なし'}`,
+            `要点: ${digest.notablePoints.length > 0 ? digest.notablePoints.join(' / ') : 'なし'}`,
+        ].join('\n'))
+        .join('\n\n');
+
+    const parts: any[] = [
+        { text: TOPIC_EXTRACTION_FROM_SUMMARIES_PROMPT },
+        { text: `音声断片メモ:\n${digestText}` },
+    ];
+
+    if (textEntries.length > 0) {
+        parts.push({
+            text: [
+                '関連テキストチャット:',
+                ...textEntries.map((entry) => `[${entry.timestamp}] ${entry.authorName}: ${entry.content}`),
+            ].join('\n'),
+        });
+    }
+
+    const response = await withTimeout(
+        ai.models.generateContent({
+            model: useModel,
+            contents: [
+                {
+                    role: 'user',
+                    parts,
+                },
+            ],
+            config: {
+                responseMimeType: 'application/json',
+            } as any,
+        }),
+        SUMMARY_ONLY_TOPIC_TIMEOUT_MS,
+        '要約メモからの記事候補抽出',
+    );
+
+    return toJsonResult(response.text || '{"sessionSummary":"","topics":[]}');
+}
+
 async function generateTopicExtractionResult(
     ai: GoogleGenAI,
     useModel: string,
@@ -276,7 +422,7 @@ async function generateTopicExtractionResult(
                     ],
                     {
                         responseMimeType: 'application/json',
-                        isThinkingModel: isThinkingModel(useModel),
+                        isThinkingModel: isGeminiThinkingModel(useModel),
                         forceSearch: true,
                     },
                 ),
@@ -302,7 +448,7 @@ async function generateTopicExtractionResult(
                 ],
                 config: {
                     responseMimeType: 'application/json',
-                    ...(isThinkingModel(useModel)
+                    ...(isGeminiThinkingModel(useModel)
                         ? {
                             thinkingConfig: {
                                 thinkingLevel: 'HIGH' as any,
@@ -332,7 +478,7 @@ export async function extractArticleTopics(
     }
 
     const ai = createAiClient(apiKey);
-    const useModel = modelName || GEMINI_MODEL_FLASH;
+    const useModel = resolveGeminiModel(modelName);
     let lastResult: TopicExtractionResult | null = null;
 
     try {
@@ -382,6 +528,39 @@ export async function extractArticleTopics(
             },
         );
     } catch (error) {
+        if (!shouldRetryTopicExtraction(error)) {
+            throw normalizeTopicExtractionError(error);
+        }
+    }
+
+    try {
+        await reportProgress(
+            onProgress,
+            '🧯 最後の手段として音声断片を個別に要約し、記事候補を再構成しています...',
+        );
+        const digests = (
+            await Promise.all(
+                audioClips.map((clip, index) =>
+                    summarizeAudioClip(ai, useModel, clip, index, audioClips.length, onProgress),
+                ),
+            )
+        ).filter((digest): digest is AudioClipDigest => digest !== null);
+
+        const digestResult = await extractTopicsFromDigests(
+            ai,
+            useModel,
+            digests,
+            textEntries,
+            onProgress,
+        );
+        if (digestResult.topics.length > 0) {
+            return digestResult;
+        }
+        if (lastResult) {
+            return lastResult;
+        }
+        return digestResult;
+    } catch (error) {
         if (lastResult) {
             return lastResult;
         }
@@ -401,7 +580,7 @@ export async function generateArticleFromTopic(
     }
 
     const ai = createAiClient(apiKey);
-    const useModel = modelName || GEMINI_MODEL_FLASH;
+    const useModel = resolveGeminiModel(modelName);
     const { uploadedFiles, audioParts } = await uploadAudioParts(ai, audioClips);
 
     if (uploadedFiles.length === 0) {
@@ -424,7 +603,7 @@ export async function generateArticleFromTopic(
                 ...audioParts,
             ],
             {
-                isThinkingModel: isThinkingModel(useModel),
+                isThinkingModel: isGeminiThinkingModel(useModel),
                 forceSearch: true,
             },
         );

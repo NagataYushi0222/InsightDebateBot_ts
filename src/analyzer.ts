@@ -1,6 +1,10 @@
 import { GoogleGenAI } from '@google/genai';
 import fs from 'fs';
-import { GEMINI_API_KEY, GEMINI_MODEL_FLASH } from './config';
+import {
+    GEMINI_API_KEY,
+    isGeminiThinkingModel,
+    resolveGeminiModel,
+} from './config';
 import {
     generateContentWithWebSearch,
     SearchTrace,
@@ -46,6 +50,23 @@ export interface StructuredDiscussionMemory {
 export interface AnalyzeDiscussionResult {
     report: string;
     memory: StructuredDiscussionMemory | null;
+    modelName: string;
+}
+
+function normalizeAnalysisError(error: unknown): string {
+    const message = error instanceof Error ? error.message : String(error);
+
+    if (/PERMISSION_DENIED|denied access/i.test(message)) {
+        return '❌ Gemini API のプロジェクト権限が拒否されています。`/settings set_apikey` で別の有効な API キーを登録し、要約/ディベートを再開始してください。';
+    }
+    if (/429|Quota exceeded|RESOURCE_EXHAUSTED/i.test(message)) {
+        return '⚠️ Gemini API のリクエスト制限（Quota Limit）に達しました。時間を置くか、別の有効な API キー/モデルで再試行してください。';
+    }
+    if (/503|UNAVAILABLE|high demand/i.test(message)) {
+        return '⚠️ Gemini が混雑しています。少し時間を置いて再試行してください。';
+    }
+
+    return `分析中にエラーが発生しました: ${message}`;
 }
 
 function buildSearchReferenceEntries(searchTrace: SearchTrace[]): SearchReferenceEntry[] {
@@ -578,12 +599,15 @@ export async function analyzeDiscussion(
     modelName: string | null = null,
     dialogueTheme: string | null = null,
 ): Promise<AnalyzeDiscussionResult> {
+    const useModel = resolveGeminiModel(modelName);
+
     // APIキーの決定
     const useKey = apiKey || GEMINI_API_KEY;
     if (!useKey) {
         return {
-            report: '❌ APIキーが設定されていません。`/settings set_key` で設定してください。',
+            report: '❌ APIキーが設定されていません。`/settings set_apikey` で設定してください。',
             memory: previousMemory,
+            modelName: useModel,
         };
     }
 
@@ -595,6 +619,7 @@ export async function analyzeDiscussion(
         return {
             report: `❌ APIクライアントの初期化に失敗しました: ${e}`,
             memory: previousMemory,
+            modelName: useModel,
         };
     }
 
@@ -652,6 +677,7 @@ export async function analyzeDiscussion(
         return {
             report: '音声データがありませんでした（アップロード失敗またはファイルなし）。',
             memory: previousMemory,
+            modelName: useModel,
         };
     }
 
@@ -659,10 +685,9 @@ export async function analyzeDiscussion(
         await waitForFilesActive(ai, uploadedFiles);
 
         // Gemini APIで分析実行（検索は function calling で付与）
-        const useModel = modelName || GEMINI_MODEL_FLASH;
         console.log(`[Analyzer] 使用モデル: ${useModel}`);
 
-        const isThinkingModel = useModel.includes('gemini-3.0') || useModel.includes('gemini-3.1');
+        const isThinkingModel = isGeminiThinkingModel(useModel);
 
         try {
             const { response, searchTrace } = await generateContentWithWebSearch(
@@ -694,6 +719,7 @@ export async function analyzeDiscussion(
             return {
                 report,
                 memory,
+                modelName: useModel,
             };
 
         } catch (e: any) {
@@ -711,16 +737,10 @@ export async function analyzeDiscussion(
         }
 
         console.error(`Analysis Error: ${e}`);
-        const errStr = String(e);
-        if (errStr.includes('429') || errStr.includes('Quota exceeded')) {
-            return {
-                report: '⚠️ 検索付き分析のリクエスト制限（Quota Limit）に達しました。',
-                memory: previousMemory,
-            };
-        }
         return {
-            report: `分析中にエラーが発生しました: ${e}`,
+            report: normalizeAnalysisError(e),
             memory: previousMemory,
+            modelName: useModel,
         };
     }
 }

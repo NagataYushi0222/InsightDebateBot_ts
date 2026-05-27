@@ -72,11 +72,10 @@ Discord のボイスチャットを録音し、Gemini で定期分析や最終�
 
 ## 対応モデル
 
-現状のコマンドから選べるモデルは次の 3 つです。
+現状のコマンドから選べるモデルは次の 2 つです。
 
-- `gemini-2.5-flash`
-- `gemini-3-flash-preview`
-- `gemini-3.1-flash-lite-preview`
+- `gemini-3.5-flash`（デフォルト）
+- `gemini-3.1-flash-lite`
 
 ## 必要なもの
 
