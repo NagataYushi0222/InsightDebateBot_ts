@@ -65,6 +65,16 @@ export class VoiceDisconnectReporter {
         this.destroyIfActive(report.connection);
     }
 
+    /**
+     * 指定した接続の切断通知を抑制する。
+     * 自動再接続成功時など、古い接続が破棄されても切断メッセージを出したくない場合に使う。
+     */
+    suppressReport(connection: VoiceConnection): void {
+        if (connection) {
+            this.reportedConnections.add(connection);
+        }
+    }
+
     private destroyIfActive(connection: VoiceConnection | null): void {
         if (connection && connection.state.status !== VoiceConnectionStatus.Destroyed) {
             connection.destroy();

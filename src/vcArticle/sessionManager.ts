@@ -3,7 +3,7 @@ import {
     VoiceConnectionStatus,
 } from '@ovencord/voice';
 import { Client, Guild, Message, TextChannel } from 'discord.js';
-import { cleanupFiles, convertToMp3 } from '../audioProcessor';
+import { cleanupFiles, convertToMp3Async } from '../audioProcessor';
 import { getGuildSettings } from '../database';
 import { UserAudioRecorder } from '../recorder';
 import { attachVoiceCaptureConsumer } from '../voiceCaptureHub';
@@ -67,6 +67,40 @@ export class VcArticleSession {
 
     isBusy(): boolean {
         return this.isRecording || this.isStopping;
+    }
+
+    /**
+     * 一時的な切断から復帰するため、新しい VoiceConnection を再アタッチする。
+     * 録音中の state・保留音声クリップ・テキストログはそのまま維持する。
+     */
+    reattachVoiceConnection(connection: VoiceConnection, guild: Guild): void {
+        this.voiceConnection = connection;
+        this.detachFromVoiceCapture();
+        this.detachVoiceCapture = attachVoiceCaptureConsumer(connection, {
+            consumerLabel: this.consumerLabel,
+            onSpeakerStart: (userId) => {
+                this.rememberDisplayName(guild, userId);
+            },
+            onAudio: (userId, pcmData) => {
+                if (!this.isRecording || !this.recorder) return;
+                if (!this.userMap.has(userId)) {
+                    this.rememberDisplayName(guild, userId);
+                }
+                this.recorder.write(userId, pcmData);
+            },
+            onStats: (stats) => {
+                this.lastVoiceStats = stats;
+            },
+        });
+    }
+
+    /**
+     * 再接続に先立ち、古い VoiceConnection の参照とキャプチャ購読を解放し、
+     * sharedVoiceCoordinator が「active な接続がない」と判定できるようにする。
+     */
+    prepareForReconnect(): void {
+        this.detachFromVoiceCapture();
+        this.voiceConnection = null;
     }
 
     isStoppingInProgress(): boolean {
@@ -450,7 +484,7 @@ export class VcArticleSession {
 
         for (const [userId, pcmPath] of rawFiles.entries()) {
             cleanupTargets.push(pcmPath);
-            const mp3Path = convertToMp3(pcmPath);
+            const mp3Path = await convertToMp3Async(pcmPath);
             if (!mp3Path) continue;
 
             this.chunkSequence += 1;

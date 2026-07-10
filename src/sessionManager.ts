@@ -6,7 +6,7 @@ import fs from 'fs';
 import path from 'path';
 import { Client, TextChannel, Guild, Message } from 'discord.js';
 import { UserAudioRecorder } from './recorder';
-import { convertToMp3, cleanupFiles } from './audioProcessor';
+import { convertToMp3Async, cleanupFiles } from './audioProcessor';
 import { analyzeDiscussion, StructuredDiscussionMemory } from './analyzer';
 import { getGeminiModelDisplayName, resolveGeminiModel, TEMP_AUDIO_DIR } from './config';
 import { getGuildSettings, GuildSettings } from './database';
@@ -150,12 +150,42 @@ export class GuildSession {
         this.processLoopPromise = loopPromise;
     }
 
-    hasActiveConnection(): boolean {
+hasActiveConnection(): boolean {
         return !!this.voiceConnection && this.voiceConnection.state.status !== VoiceConnectionStatus.Destroyed;
     }
 
     isBusy(): boolean {
         return this.isRecording || this.isStopping || !!this.processingPromise;
+    }
+
+    /**
+     * 一時的な切断から復帰するため、新しい VoiceConnection を再アタッチする。
+     * structuredMemory・録音サイクル・APIキーなどはそのまま維持し、
+     * 音声キャプチャだけ新しい接続へ切り替える。
+     */
+    reattachVoiceConnection(connection: VoiceConnection): void {
+        this.voiceConnection = connection;
+        this.detachFromVoiceCapture();
+        this.detachVoiceCapture = attachVoiceCaptureConsumer(connection, {
+            consumerLabel: this.consumerLabel,
+            onAudio: (userId, pcmData) => {
+                if (!this.isRecording || !this.recorder) return;
+                this.recorder.write(userId, pcmData);
+            },
+            onStats: (stats) => {
+                this.lastVoiceStats = stats;
+            },
+        });
+    }
+
+    /**
+     * 再接続に先立ち、古い VoiceConnection の参照とキャプチャ購読を解放する。
+     * isRecording やメモリは維持したまま、sharedVoiceCoordinator が
+     * 「active な接続がない」と判定できるようにする。
+     */
+    prepareForReconnect(): void {
+        this.detachFromVoiceCapture();
+        this.voiceConnection = null;
     }
 
     isStoppingInProgress(): boolean {
@@ -590,13 +620,15 @@ export class GuildSession {
                 : 'エンコード中';
             await this.refreshStatusMessage(undefined, true);
 
-            for (const [userId, rawPath] of audioBatch.analysisRawFiles.entries()) {
-                const mp3Path = convertToMp3(rawPath);
-                if (mp3Path) {
-                    userFilesMp3.set(userId, mp3Path);
-                    filesToCleanup.push(mp3Path);
-                }
-            }
+await Promise.all(
+                Array.from(audioBatch.analysisRawFiles.entries()).map(async ([userId, rawPath]) => {
+                    const mp3Path = await convertToMp3Async(rawPath);
+                    if (mp3Path) {
+                        userFilesMp3.set(userId, mp3Path);
+                        filesToCleanup.push(mp3Path);
+                    }
+                }),
+            );
 
             if (userFilesMp3.size !== audioBatch.analysisRawFiles.size) {
                 this.retainRawAudioFiles(audioBatch.sourceRawFilesByUser);

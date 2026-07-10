@@ -6,7 +6,9 @@ import {
     MessageFlags,
     REST,
     Routes,
+    VoiceBasedChannel,
 } from 'discord.js';
+import { VoiceConnectionStatus } from '@ovencord/voice';
 import {
     DISCORD_TOKEN,
 } from './config';
@@ -208,6 +210,16 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
         );
         if (oldState.channelId && oldState.channelId !== newState.channelId) {
             const guildId = oldState.guild.id;
+            const movedToAnotherChannel = !!newState.channelId;
+
+            // VC 退出時に録音セッションが生きていれば自動再接続を試みる
+            if (!movedToAnotherChannel && oldState.channel) {
+                const result = await attemptVoiceReconnect(guildId, oldState.channel);
+                if (result === 'reconnected' || result === 'handled') {
+                    return;
+                }
+            }
+
             const connection = sharedVoiceCoordinator.getActiveGuildVoiceConnection(guildId);
             if (connection?.joinConfig.channelId === oldState.channelId) {
                 await voiceDisconnectReporter.reportBeforeDestroy({
@@ -452,6 +464,108 @@ async function handleCheck(
         }),
         flags: MessageFlags.Ephemeral,
     });
+}
+
+type ReconnectResult = 'reconnected' | 'handled' | 'not_needed';
+
+/**
+ * Bot が VC から意図せず退出した際、録音セッションが生きていて
+ * VC に人間が残っていれば同じチャンネルへ自動再接続する。
+ *
+ * - 成功: 'reconnected'（切断メッセージは出さず、復帰メッセージだけ出す）
+ * - 失敗: 'handled'（セッションを安全に終了し、切断通知を送信済み）
+ * - 不要: 'not_needed'（呼び出し元が元の切断処理に入る）
+ */
+async function attemptVoiceReconnect(
+    guildId: string,
+    voiceChannel: VoiceBasedChannel,
+): Promise<ReconnectResult> {
+    const analyzeSession = sessionManager.getExistingSession(guildId);
+    const articleSession = vcArticleManager.getExistingSession(guildId);
+
+    const analyzeWantsReconnect = !!analyzeSession?.isRecording;
+    const articleWantsReconnect = !!articleSession?.isRecording;
+
+    if (!analyzeWantsReconnect && !articleWantsReconnect) {
+        return 'not_needed';
+    }
+
+    // VC に人間が残っていなければ復帰不要（全員退出の扱いは別ハンドラに任せる）
+    const nonBotMembers = voiceChannel.members.filter((member) => !member.user.bot);
+    if (nonBotMembers.size === 0) {
+        return 'not_needed';
+    }
+
+    const oldConnection =
+        analyzeSession?.voiceConnection
+        || articleSession?.voiceConnection
+        || null;
+
+    const guild = client.guilds.cache.get(guildId);
+    if (!guild) {
+        return 'not_needed';
+    }
+
+    const fallbackTextChannel =
+        analyzeSession?.targetTextChannel
+        || articleSession?.targetTextChannel
+        || null;
+
+    try {
+        if (analyzeSession) analyzeSession.prepareForReconnect();
+        if (articleSession) articleSession.prepareForReconnect();
+
+        const { connection } = await sharedVoiceCoordinator.ensureVoiceConnectionForChannel(
+            guildId,
+            voiceChannel,
+            guild.voiceAdapterCreator,
+        );
+
+        if (analyzeWantsReconnect && analyzeSession) {
+            analyzeSession.reattachVoiceConnection(connection);
+        }
+        if (articleWantsReconnect && articleSession) {
+            articleSession.reattachVoiceConnection(connection, guild);
+        }
+
+        // 古い接続は不要になったので破棄するが、切断通知は抑制する
+        if (oldConnection && oldConnection.state.status !== VoiceConnectionStatus.Destroyed) {
+            voiceDisconnectReporter.suppressReport(oldConnection);
+            oldConnection.destroy();
+        }
+
+        if (fallbackTextChannel) {
+            await fallbackTextChannel
+                .send('♻️ 一時的な音声接続の切断を検知し、VC へ再接続しました。録音は継続します。')
+                .catch(() => undefined);
+        }
+        runtimeMonitor.logSessionCleanup('voice_auto_reconnected', guildId);
+        return 'reconnected';
+    } catch (error) {
+        console.error(
+            `[Reconnect] Failed to rejoin voice channel ${voiceChannel.name} for guild ${guildId}:`,
+            error,
+        );
+
+        // 再接続失敗: セッションを安全に終了させる
+        await voiceDisconnectReporter.report({
+            guildId,
+            connection: oldConnection,
+            reason: 'VC からの一時切断後に再接続できなかったため',
+            detail: error instanceof Error ? error.message : String(error),
+            fallbackTextChannel,
+        });
+
+        runtimeMonitor.logSessionCleanup('voice_reconnect_failed', guildId);
+        if (analyzeSession) {
+            await sessionManager.cleanupSession(guildId, true, false).catch(() => undefined);
+        }
+        if (articleSession) {
+            await vcArticleManager.cleanupSession(guildId, true).catch(() => undefined);
+        }
+        await liveVoiceStatusDisplay.deleteMonitor(guildId).catch(() => undefined);
+        return 'handled';
+    }
 }
 
 export function runBotWithVcArticle(): void {

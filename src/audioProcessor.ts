@@ -1,42 +1,66 @@
-import { execSync } from 'child_process';
+import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { TEMP_AUDIO_DIR } from './config';
 
+function resolveFfmpegPath(): string {
+    try {
+        return require('ffmpeg-static') as string;
+    } catch {
+        return 'ffmpeg';
+    }
+}
+
+function runFfmpegAsync(args: string[]): Promise<void> {
+    return new Promise((resolve, reject) => {
+        const child = spawn(args[0], args.slice(1), { stdio: 'pipe' });
+        let stderr = '';
+        child.stderr?.on('data', (chunk) => {
+            stderr += chunk.toString();
+        });
+        child.once('error', reject);
+        child.once('close', (code) => {
+            if (code === 0) {
+                resolve();
+            } else {
+                reject(new Error(`ffmpeg exited with code ${code}\n${stderr.slice(-512)}`));
+            }
+        });
+    });
+}
+
 /**
  * FFmpegを使用してPCMファイルをMP3に変換する
  * Discord PCM: s16le, 48000Hz, 2ch
+ *
+ * 非同期版: spawn を使ってイベントループを block しない。
+ * 長時間録音（10分超）でも Discord 音声 WebSocket のハートビートが途切れない。
  */
-export function convertToMp3(filePath: string): string | null {
+export async function convertToMp3Async(filePath: string): Promise<string | null> {
     if (!fs.existsSync(filePath)) {
         return null;
     }
 
+    const mp3Path = filePath.replace(/\.\w+$/, '.mp3');
+    const ffmpegPath = resolveFfmpegPath();
+
     try {
-        const mp3Path = filePath.replace(/\.\w+$/, '.mp3');
-
-        // まず同梱 ffmpeg を使い、なければサーバーに入っている ffmpeg を使う。
-        let ffmpegPath: string;
-        try {
-            ffmpegPath = require('ffmpeg-static') as string;
-        } catch {
-            ffmpegPath = 'ffmpeg'; // fallback to system ffmpeg
-        }
-
         if (filePath.endsWith('.pcm')) {
-            // 生 PCM はヘッダがないので、サンプル形式を ffmpeg に明示する必要がある。
-            execSync(
-                `"${ffmpegPath}" -f s16le -ar 48000 -ac 2 -i "${filePath}" -y "${mp3Path}"`,
-                { stdio: 'pipe' }
-            );
+            await runFfmpegAsync([
+                ffmpegPath,
+                '-f', 's16le',
+                '-ar', '48000',
+                '-ac', '2',
+                '-i', filePath,
+                '-y', mp3Path,
+            ]);
         } else {
-            // WAV などヘッダ付きの形式なら ffmpeg に自動判定させる。
-            execSync(
-                `"${ffmpegPath}" -i "${filePath}" -y "${mp3Path}"`,
-                { stdio: 'pipe' }
-            );
+            await runFfmpegAsync([
+                ffmpegPath,
+                '-i', filePath,
+                '-y', mp3Path,
+            ]);
         }
-
         return mp3Path;
     } catch (e) {
         console.error(`Error converting ${filePath}:`, e);
