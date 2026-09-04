@@ -43,6 +43,7 @@ import { formatTopicsMessage } from './commands/articleFormatting';
 import { buildAnalyzeCheckMessage, getModeDisplayName } from './commands/display';
 import { sendChannelMessageInChunks } from './commands/replies';
 import { handleImakitaCommand } from './commands/imakita';
+import { ImakitaSessionManager } from './imakitaSession';
 import { handleModelCommand, handleSettingsCommand } from './commands/settings';
 
 initDb();
@@ -58,6 +59,7 @@ const client = new Client({
 
 const sessionManager = new SessionManager(client);
 const vcArticleManager = new VcArticleSessionManager(client);
+const imakitaManager = new ImakitaSessionManager();
 const liveVoiceStatusDisplay = new LiveVoiceStatusDisplay(client, sessionManager, vcArticleManager);
 const voiceDisconnectReporter = new VoiceDisconnectReporter(
     client,
@@ -69,6 +71,7 @@ const sharedVoiceCoordinator = new SharedVoiceCoordinator(
     client,
     sessionManager,
     vcArticleManager,
+    imakitaManager,
     (event) => voiceDisconnectReporter.report(event),
 );
 const runtimeMonitor = new RuntimeMonitor(client, sessionManager, vcArticleManager, sharedVoiceCoordinator);
@@ -182,8 +185,10 @@ client.on('interactionCreate', async (interaction) => {
                 await handleCheck(interaction, guildId);
                 break;
             case 'imakita':
-                await handleImakitaCommand(interaction, guildId);
+                await handleImakitaCommand(interaction, guildId, imakitaManager);
                 break;
+            case 'join': await handleImakitaJoin(interaction, guildId); break;
+            case 'leave': await handleImakitaLeave(interaction, guildId); break;
         }
     } catch (error: any) {
         if (error.code === 10062) return;
@@ -326,6 +331,26 @@ async function handleAnalyzeStart(
         return;
     }
     await handleConfiguredAnalyzeStart(interaction, guildId, analyzeModeEnvironment);
+}
+
+async function handleImakitaJoin(interaction: ChatInputCommandInteraction, guildId: string): Promise<void> {
+    const member = interaction.guild!.members.cache.get(interaction.user.id);
+    const voiceChannel = member?.voice.channel;
+    if (!voiceChannel) { await interaction.reply({ content: 'VCに参加してから `/join` を実行してください。', flags: MessageFlags.Ephemeral }); return; }
+    const session = imakitaManager.getSession(guildId);
+    if (session.isRecording) { await interaction.reply({ content: '今北産業用の録音はすでに開始されています。', flags: MessageFlags.Ephemeral }); return; }
+    await interaction.deferReply();
+    const { connection } = await sharedVoiceCoordinator.ensureVoiceConnectionForChannel(guildId, voiceChannel, interaction.guild!.voiceAdapterCreator);
+    await session.start(connection, interaction.guild!);
+    await interaction.editReply(`🎧 **今北産業用録音を開始しました**\n対象VC: **${voiceChannel.name}**\n直近10分だけを保持します。定期分析は実行しません。`);
+}
+
+async function handleImakitaLeave(interaction: ChatInputCommandInteraction, guildId: string): Promise<void> {
+    const session = imakitaManager.getSession(guildId);
+    if (!session.isRecording) { await interaction.reply({ content: '今北産業用の録音は開始されていません。', flags: MessageFlags.Ephemeral }); return; }
+    const destroy = !sessionManager.getExistingSession(guildId)?.isRecording && !vcArticleManager.getExistingSession(guildId)?.isRecording;
+    await session.stop(destroy);
+    await interaction.reply('👋 今北産業用の録音を停止しました。');
 }
 
 async function handleAnalyzeStop(

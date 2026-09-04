@@ -66,12 +66,6 @@ export function buildSharedUtilityCommands(): SharedCommandBuilder[] {
                             .setRequired(true)
                             .setMinValue(60)
                     )
-            )
-            .addSubcommand((sub) =>
-                sub
-                    .setName('set_model')
-                    .setDescription('使用するAIモデルを変更します')
-                    .addStringOption((opt) => addModelChoices(opt))
             ),
         new SlashCommandBuilder()
             .setName('model')
@@ -82,6 +76,8 @@ export function buildSharedUtilityCommands(): SharedCommandBuilder[] {
             .setDescription('現在のBot設定を確認します'),
         new SlashCommandBuilder()
             .setName('imakita')
-            .setDescription('今北産業：このチャンネルの直近の会話を3行で要約します'),
+            .setDescription('今北産業：VC音声と直近10分のチャットを3行で要約します'),
+        new SlashCommandBuilder().setName('join').setDescription('今北産業用にVCへ参加し、直近10分の録音を開始します'),
+        new SlashCommandBuilder().setName('leave').setDescription('今北産業用の録音を停止し、VCから退出します'),
     ];
 }

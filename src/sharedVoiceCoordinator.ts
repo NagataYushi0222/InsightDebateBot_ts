@@ -8,6 +8,7 @@ import {
 import { Client, VoiceBasedChannel } from 'discord.js';
 import { SessionManager } from './sessionManager';
 import { VcArticleSessionManager } from './vcArticle/sessionManager';
+import { ImakitaSessionManager } from './imakitaSession';
 
 interface ChannelActivityState {
     analyzeActive: boolean;
@@ -47,6 +48,7 @@ export class SharedVoiceCoordinator {
         private readonly client: Client,
         private readonly sessionManager: SessionManager,
         private readonly vcArticleManager: VcArticleSessionManager,
+        private readonly imakitaManager: ImakitaSessionManager,
         private readonly onVoiceDisconnect?: (event: SharedVoiceDisconnectEvent) => Promise<void> | void,
     ) {}
 
@@ -61,18 +63,20 @@ export class SharedVoiceCoordinator {
         if (articleSession?.isRecording && articleSession.hasActiveConnection()) {
             return articleSession.voiceConnection;
         }
+        const imakitaSession = this.imakitaManager.getExistingSession(guildId);
+        if (imakitaSession?.isRecording && imakitaSession.hasActiveConnection()) return imakitaSession.voiceConnection;
 
         return null;
     }
 
     shouldDestroyAnalyzeConnection(guildId: string): boolean {
         const { sharedConnection, articleActive } = this.getGuildActivityState(guildId);
-        return !(sharedConnection && articleActive);
+        return !(articleActive || !!this.imakitaManager.getExistingSession(guildId)?.isRecording);
     }
 
     shouldDestroyArticleConnection(guildId: string): boolean {
         const { sharedConnection, analyzeActive } = this.getGuildActivityState(guildId);
-        return !(sharedConnection && analyzeActive);
+        return !(analyzeActive || !!this.imakitaManager.getExistingSession(guildId)?.isRecording);
     }
 
     getChannelActivityState(guildId: string, channelId: string): ChannelActivityState {

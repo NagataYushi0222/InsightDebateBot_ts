@@ -30,6 +30,7 @@ import {
 import { handleModelCommand, handleSettingsCommand } from './commands/settings';
 import { buildAnalyzeCheckMessage } from './commands/display';
 import { handleImakitaCommand } from './commands/imakita';
+import { ImakitaSessionManager } from './imakitaSession';
 
 // データベース初期化
 initDb();
@@ -45,6 +46,7 @@ const client = new Client({
 });
 
 const sessionManager = new SessionManager(client);
+const imakitaManager = new ImakitaSessionManager();
 const liveVoiceStatusDisplay = new LiveVoiceStatusDisplay(client, sessionManager);
 const voiceDisconnectReporter = new VoiceDisconnectReporter(client, sessionManager, liveVoiceStatusDisplay);
 sessionManager.setStatusAnchorHandler((guildId, message) => liveVoiceStatusDisplay.bindMessage(guildId, message));
@@ -191,7 +193,7 @@ client.on('interactionCreate', async (interaction) => {
         } else if (interaction.commandName === 'check') {
             await handleCheck(interaction, guildId);
         } else if (interaction.commandName === 'imakita') {
-            await handleImakitaCommand(interaction, guildId);
+            await handleImakitaCommand(interaction, guildId, imakitaManager);
         }
     } catch (e: any) {
         // Unknown interaction (10062) は無視する
