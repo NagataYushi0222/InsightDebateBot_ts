@@ -5,6 +5,7 @@ import {
     SlashCommandSubcommandsOnlyBuilder,
 } from 'discord.js';
 import {
+    GEMINI_MODEL_38_FLASH,
     GEMINI_MODEL_37_FLASH,
     GEMINI_MODEL_35_FLASH_LITE,
 } from '../../config';
@@ -20,6 +21,7 @@ function addModelChoices(option: SlashCommandStringOption): SlashCommandStringOp
         .setDescription('モデル')
         .setRequired(true)
         .addChoices(
+            { name: 'Gemini 3.8 Flash', value: GEMINI_MODEL_38_FLASH },
             { name: 'Gemini 3.7 Flash', value: GEMINI_MODEL_37_FLASH },
             { name: 'Gemini 3.5 Flash Lite', value: GEMINI_MODEL_35_FLASH_LITE }
         );
