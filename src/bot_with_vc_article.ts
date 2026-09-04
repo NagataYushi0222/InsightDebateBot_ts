@@ -331,6 +331,21 @@ async function handleAnalyzeStart(
         return;
     }
     await handleConfiguredAnalyzeStart(interaction, guildId, analyzeModeEnvironment);
+    await startImakitaCaptureForAnalyze(guildId, interaction);
+}
+
+async function startImakitaCaptureForAnalyze(
+    guildId: string,
+    interaction: ChatInputCommandInteraction,
+): Promise<void> {
+    const analyzeSession = sessionManager.getExistingSession(guildId);
+    const imakitaSession = imakitaManager.getSession(guildId);
+    if (!analyzeSession?.isRecording || !analyzeSession.voiceConnection || imakitaSession.isRecording) {
+        return;
+    }
+
+    await imakitaSession.start(analyzeSession.voiceConnection, interaction.guild!);
+    console.log(`[Imakita] Started passive capture alongside analysis for guild ${guildId}`);
 }
 
 async function handleImakitaJoin(interaction: ChatInputCommandInteraction, guildId: string): Promise<void> {
