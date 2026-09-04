@@ -5,7 +5,7 @@ import {
     SlashCommandSubcommandsOnlyBuilder,
 } from 'discord.js';
 import {
-    GEMINI_MODEL_36_FLASH,
+    GEMINI_MODEL_37_FLASH,
     GEMINI_MODEL_35_FLASH_LITE,
 } from '../../config';
 
@@ -20,7 +20,7 @@ function addModelChoices(option: SlashCommandStringOption): SlashCommandStringOp
         .setDescription('モデル')
         .setRequired(true)
         .addChoices(
-            { name: 'Gemini 3.6 Flash', value: GEMINI_MODEL_36_FLASH },
+            { name: 'Gemini 3.7 Flash', value: GEMINI_MODEL_37_FLASH },
             { name: 'Gemini 3.5 Flash Lite', value: GEMINI_MODEL_35_FLASH_LITE }
         );
 }
@@ -78,5 +78,8 @@ export function buildSharedUtilityCommands(): SharedCommandBuilder[] {
         new SlashCommandBuilder()
             .setName('check')
             .setDescription('現在のBot設定を確認します'),
+        new SlashCommandBuilder()
+            .setName('imakita')
+            .setDescription('今北産業：このチャンネルの直近の会話を3行で要約します'),
     ];
 }

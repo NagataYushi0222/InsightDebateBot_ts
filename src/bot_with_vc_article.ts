@@ -42,6 +42,7 @@ import {
 import { formatTopicsMessage } from './commands/articleFormatting';
 import { buildAnalyzeCheckMessage, getModeDisplayName } from './commands/display';
 import { sendChannelMessageInChunks } from './commands/replies';
+import { handleImakitaCommand } from './commands/imakita';
 import { handleModelCommand, handleSettingsCommand } from './commands/settings';
 
 initDb();
@@ -179,6 +180,9 @@ client.on('interactionCreate', async (interaction) => {
                 break;
             case 'check':
                 await handleCheck(interaction, guildId);
+                break;
+            case 'imakita':
+                await handleImakitaCommand(interaction, guildId);
                 break;
         }
     } catch (error: any) {

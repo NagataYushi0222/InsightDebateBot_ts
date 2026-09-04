@@ -29,6 +29,7 @@ import {
 } from './commands/analyzeModeHandlers';
 import { handleModelCommand, handleSettingsCommand } from './commands/settings';
 import { buildAnalyzeCheckMessage } from './commands/display';
+import { handleImakitaCommand } from './commands/imakita';
 
 // データベース初期化
 initDb();
@@ -39,6 +40,7 @@ const client = new Client({
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildVoiceStates,
         GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent,
     ],
 });
 
@@ -188,6 +190,8 @@ client.on('interactionCreate', async (interaction) => {
             await handleModel(interaction, guildId);
         } else if (interaction.commandName === 'check') {
             await handleCheck(interaction, guildId);
+        } else if (interaction.commandName === 'imakita') {
+            await handleImakitaCommand(interaction, guildId);
         }
     } catch (e: any) {
         // Unknown interaction (10062) は無視する

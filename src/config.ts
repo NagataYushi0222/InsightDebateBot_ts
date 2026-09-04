@@ -11,14 +11,15 @@ export const SAMPLE_RATE = 48000;
 export const CHANNELS = 2;
 
 // Models
-export const GEMINI_MODEL_36_FLASH = 'gemini-3.6-flash';
+export const GEMINI_MODEL_37_FLASH = 'gemini-3.7-flash';
 export const GEMINI_MODEL_35_FLASH_LITE = 'gemini-3.5-flash-lite';
-export const DEFAULT_MODEL = GEMINI_MODEL_36_FLASH;
+export const DEFAULT_MODEL = GEMINI_MODEL_37_FLASH;
 
 export const DEPRECATED_MODEL_REPLACEMENTS: Record<string, string> = {
-    'gemini-3.5-flash': GEMINI_MODEL_36_FLASH,
-    'gemini-3-flash-preview': GEMINI_MODEL_36_FLASH,
-    'gemini-2.5-flash': GEMINI_MODEL_36_FLASH,
+    'gemini-3.6-flash': GEMINI_MODEL_37_FLASH,
+    'gemini-3.5-flash': GEMINI_MODEL_37_FLASH,
+    'gemini-3-flash-preview': GEMINI_MODEL_37_FLASH,
+    'gemini-2.5-flash': GEMINI_MODEL_37_FLASH,
     'gemini-3.1-flash-lite': GEMINI_MODEL_35_FLASH_LITE,
     'gemini-3.1-flash-lite-preview': GEMINI_MODEL_35_FLASH_LITE,
     'gemini-2.5-flash-lite': GEMINI_MODEL_35_FLASH_LITE,
@@ -32,8 +33,8 @@ export function resolveGeminiModel(modelName: string | null | undefined): string
 
 export function getGeminiModelDisplayName(modelId: string): string {
     switch (modelId) {
-        case GEMINI_MODEL_36_FLASH:
-            return 'Gemini 3.6 Flash';
+        case GEMINI_MODEL_37_FLASH:
+            return 'Gemini 3.7 Flash';
         case GEMINI_MODEL_35_FLASH_LITE:
             return 'Gemini 3.5 Flash Lite';
         default:
