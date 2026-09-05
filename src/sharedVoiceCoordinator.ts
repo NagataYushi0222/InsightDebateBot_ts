@@ -40,6 +40,12 @@ export interface SharedVoiceDisconnectEvent {
     detail?: string;
 }
 
+const SENSITIVE_KEY_PATTERN = /("(?:secretKey|token|sessionId|session_id|secret_key|authorization)")\s*:\s*("(?:[^"\\]|\\.)*"|\[[^\]]*\]|[^\s,}\]]+)/gi;
+
+function redactVoiceDebugMessage(message: string): string {
+    return message.replace(SENSITIVE_KEY_PATTERN, '$1: "[REDACTED]"');
+}
+
 export class SharedVoiceCoordinator {
     private readonly managedVoiceConnections = new WeakSet<VoiceConnection>();
     private readonly lastDaveReinitAt = new WeakMap<VoiceConnection, number>();
@@ -225,7 +231,7 @@ export class SharedVoiceCoordinator {
             console.error('[Shared Voice] Connection Error:', error);
         });
         connection.on('debug', (message) => {
-            console.log(`[Shared Voice Debug] ${message}`);
+            console.log(`[Shared Voice Debug] ${redactVoiceDebugMessage(message)}`);
         });
 
         this.syncParticipantsForConnection(guildId, connection);

@@ -32,6 +32,11 @@ const patches = [
                 from: /const cipher = gcm\(secretKey, nonce\);\s+return cipher\.decrypt\(encryptedWithAuthTag, header\);/g,
                 to: "const cipher = gcm(secretKey, nonce, header);\n\t\t\t\treturn cipher.decrypt(encryptedWithAuthTag);",
             },
+            {
+                kind: 'literal',
+                from: 'if (decrypted) packet = decrypted;\n\t\t\t}',
+                to: 'if (decrypted) packet = decrypted;\n\t\t\t\telse return null!;\n\t\t\t}',
+            },
         ],
     },
     {
