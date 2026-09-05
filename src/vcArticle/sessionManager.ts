@@ -3,7 +3,7 @@ import {
     VoiceConnectionStatus,
 } from '@ovencord/voice';
 import { Client, Guild, Message, TextChannel } from 'discord.js';
-import { cleanupFiles, convertToMp3Async } from '../audioProcessor';
+import { cleanupFiles } from '../audioProcessor';
 import { getGuildSettings } from '../database';
 import { UserAudioRecorder } from '../recorder';
 import { attachVoiceCaptureConsumer } from '../voiceCaptureHub';
@@ -81,12 +81,12 @@ export class VcArticleSession {
             onSpeakerStart: (userId) => {
                 this.rememberDisplayName(guild, userId);
             },
-            onAudio: (userId, pcmData) => {
+            onOpus: (userId, opusPacket) => {
                 if (!this.isRecording || !this.recorder) return;
                 if (!this.userMap.has(userId)) {
                     this.rememberDisplayName(guild, userId);
                 }
-                this.recorder.write(userId, pcmData);
+                this.recorder.writeOpus(userId, opusPacket);
             },
             onStats: (stats) => {
                 this.lastVoiceStats = stats;
@@ -222,12 +222,12 @@ export class VcArticleSession {
             onSpeakerStart: (userId) => {
                 this.rememberDisplayName(guild, userId);
             },
-            onAudio: (userId, pcmData) => {
+            onOpus: (userId, opusPacket) => {
                 if (!this.isRecording || !this.recorder) return;
                 if (!this.userMap.has(userId)) {
                     this.rememberDisplayName(guild, userId);
                 }
-                this.recorder.write(userId, pcmData);
+                this.recorder.writeOpus(userId, opusPacket);
             },
             onStats: (stats) => {
                 this.lastVoiceStats = stats;
@@ -484,8 +484,7 @@ export class VcArticleSession {
 
         for (const [userId, pcmPath] of rawFiles.entries()) {
             cleanupTargets.push(pcmPath);
-            const mp3Path = await convertToMp3Async(pcmPath);
-            if (!mp3Path) continue;
+            const mp3Path = pcmPath;
 
             this.chunkSequence += 1;
             this.pendingAudioClips.push({

@@ -504,7 +504,7 @@ JSON スキーマ:
 async function uploadToGemini(
     ai: GoogleGenAI,
     filePath: string,
-    mimeType: string = 'audio/mp3'
+    mimeType: string = 'audio/ogg'
 ) {
     try {
         const fileRef = await ai.files.upload({

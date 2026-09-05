@@ -6,7 +6,7 @@ import fs from 'fs';
 import path from 'path';
 import { Client, TextChannel, Guild, Message } from 'discord.js';
 import { UserAudioRecorder } from './recorder';
-import { convertToMp3Async, cleanupFiles } from './audioProcessor';
+import { cleanupFiles } from './audioProcessor';
 import { analyzeDiscussion, StructuredDiscussionMemory } from './analyzer';
 import { getGeminiModelDisplayName, resolveGeminiModel, TEMP_AUDIO_DIR } from './config';
 import { getGuildSettings, GuildSettings } from './database';
@@ -124,9 +124,9 @@ export class GuildSession {
         this.detachFromVoiceCapture();
         this.detachVoiceCapture = attachVoiceCaptureConsumer(connection, {
             consumerLabel: this.consumerLabel,
-            onAudio: (userId, pcmData) => {
+            onOpus: (userId, opusPacket) => {
                 if (!this.isRecording || !this.recorder) return;
-                this.recorder.write(userId, pcmData);
+                this.recorder.writeOpus(userId, opusPacket);
             },
             onStats: (stats) => {
                 this.lastVoiceStats = stats;
@@ -168,9 +168,9 @@ hasActiveConnection(): boolean {
         this.detachFromVoiceCapture();
         this.detachVoiceCapture = attachVoiceCaptureConsumer(connection, {
             consumerLabel: this.consumerLabel,
-            onAudio: (userId, pcmData) => {
+            onOpus: (userId, opusPacket) => {
                 if (!this.isRecording || !this.recorder) return;
-                this.recorder.write(userId, pcmData);
+                this.recorder.writeOpus(userId, opusPacket);
             },
             onStats: (stats) => {
                 this.lastVoiceStats = stats;
@@ -482,18 +482,11 @@ hasActiveConnection(): boolean {
         const generatedRawFiles: string[] = [];
 
         for (const [userId, files] of sourceRawFilesByUser.entries()) {
-            if (files.length === 1) {
-                analysisRawFiles.set(userId, files[0]);
-                continue;
-            }
-
-            const combinedPath = path.join(
-                TEMP_AUDIO_DIR,
-                `combined_${this.guildId}_${userId}_${Date.now()}_${Math.random().toString(36).slice(2)}.pcm`,
-            );
-            await this.concatenateRawAudioFiles(files, combinedPath);
-            generatedRawFiles.push(combinedPath);
-            analysisRawFiles.set(userId, combinedPath);
+            // Oggコンテナはバイト連結できないため、再試行分も独立したGemini音声Partとして渡す。
+            files.forEach((filePath, index) => analysisRawFiles.set(
+                files.length === 1 ? userId : `${userId}__part${index + 1}`,
+                filePath,
+            ));
         }
 
         return {
@@ -587,19 +580,20 @@ hasActiveConnection(): boolean {
             }
 
             for (const userId of audioBatch.analysisRawFiles.keys()) {
-                let displayName = `User_${userId}`;
+                const discordUserId = userId.split('__part')[0];
+                let displayName = `User_${discordUserId}`;
 
                 if (guild) {
-                    const member = guild.members.cache.get(userId);
+                    const member = guild.members.cache.get(discordUserId);
                     if (member) {
                         displayName = member.displayName;
                     } else {
                         try {
-                            const fetchedMember = await guild.members.fetch(userId);
+                            const fetchedMember = await guild.members.fetch(discordUserId);
                             displayName = fetchedMember.displayName;
                         } catch {
                             try {
-                                const user = await this.bot.users.fetch(userId);
+                                const user = await this.bot.users.fetch(discordUserId);
                                 displayName = user.displayName;
                             } catch {
                                 // keep default
@@ -622,11 +616,7 @@ hasActiveConnection(): boolean {
 
 await Promise.all(
                 Array.from(audioBatch.analysisRawFiles.entries()).map(async ([userId, rawPath]) => {
-                    const mp3Path = await convertToMp3Async(rawPath);
-                    if (mp3Path) {
-                        userFilesMp3.set(userId, mp3Path);
-                        filesToCleanup.push(mp3Path);
-                    }
+                    userFilesMp3.set(userId, rawPath);
                 }),
             );
 

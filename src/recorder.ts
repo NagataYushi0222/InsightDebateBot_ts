@@ -1,7 +1,9 @@
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { TEMP_AUDIO_DIR } from './config';
 import { ensureTempDir } from './audioProcessor';
+import { OggOpusMuxer } from './oggOpusMuxer';
 
 /**
  * ユーザーごとの音声をディスクに直接書き込むレコーダー
@@ -10,6 +12,7 @@ import { ensureTempDir } from './audioProcessor';
 export class UserAudioRecorder {
     private writeStreams: Map<string, fs.WriteStream> = new Map();
     private activeFilePaths: Map<string, string> = new Map();
+    private muxers: Map<string, OggOpusMuxer> = new Map();
 
     constructor() {
         ensureTempDir();
@@ -18,17 +21,20 @@ export class UserAudioRecorder {
     /**
      * ユーザーのPCMデータをファイルに書き込み
      */
-    write(userId: string, pcmData: Buffer): void {
+    writeOpus(userId: string, opusPacket: Buffer): void {
         let stream = this.writeStreams.get(userId);
 
         if (!stream) {
             const filename = path.join(
                 TEMP_AUDIO_DIR,
-                `recording_${userId}_${Date.now()}.pcm`
+                `recording_${userId}_${Date.now()}_${crypto.randomUUID()}.ogg`
             );
-            stream = fs.createWriteStream(filename, { flags: 'a' });
+            stream = fs.createWriteStream(filename, { flags: 'wx', mode: 0o600 });
             this.writeStreams.set(userId, stream);
             this.activeFilePaths.set(userId, filename);
+            const muxer = new OggOpusMuxer();
+            this.muxers.set(userId, muxer);
+            stream.write(Buffer.concat(muxer.headers()));
 
             // エラーハンドリング
             stream.on('error', (err) => {
@@ -36,7 +42,7 @@ export class UserAudioRecorder {
             });
         }
 
-        stream.write(pcmData);
+        stream.write(this.muxers.get(userId)!.packet(opusPacket));
     }
 
     /**
@@ -53,7 +59,7 @@ export class UserAudioRecorder {
             closePromises.push(new Promise((resolve) => {
                 stream.once('close', resolve);
                 stream.once('finish', resolve);
-                stream.end();
+                stream.end(this.muxers.get(userId)?.end());
             }));
 
             if (filePath) {
@@ -66,6 +72,7 @@ export class UserAudioRecorder {
         // マップをクリア（次回の write で新規作成させる）
         this.writeStreams.clear();
         this.activeFilePaths.clear();
+        this.muxers.clear();
 
         const existingFiles = new Map<string, string>();
         for (const [userId, filePath] of flushedFiles.entries()) {

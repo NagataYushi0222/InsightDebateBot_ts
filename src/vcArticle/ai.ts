@@ -137,7 +137,7 @@ function shouldRetryTopicExtraction(error: unknown): boolean {
 async function uploadToGemini(
     ai: GoogleGenAI,
     filePath: string,
-    mimeType: string = 'audio/mp3',
+    mimeType: string = 'audio/ogg',
 ) {
     return withTimeout(
         ai.files.upload({

@@ -8,7 +8,7 @@ import { isGeminiThinkingModel, resolveGeminiModel } from '../config';
 import { getGuildSettings } from '../database';
 import { getRequiredUserApiKey } from './settings';
 import { ImakitaSessionManager } from '../imakitaSession';
-import { convertToMp3Async, cleanupFiles } from '../audioProcessor';
+import { cleanupFiles } from '../audioProcessor';
 
 const FETCH_LIMIT = 100;
 const SUMMARY_MESSAGE_LIMIT = 50;
@@ -115,10 +115,7 @@ export async function handleImakitaCommand(
         const temporaryFiles: string[] = [];
         const uploadedFiles: any[] = [];
         for (const clip of clips) {
-            const mp3 = await convertToMp3Async(clip.filePath);
-            if (!mp3) continue;
-            temporaryFiles.push(mp3);
-            const uploaded = await ai.files.upload({ file: mp3, config: { mimeType: 'audio/mp3' } });
+            const uploaded = await ai.files.upload({ file: clip.filePath, config: { mimeType: 'audio/ogg' } });
             uploadedFiles.push(uploaded);
         }
         if (uploadedFiles.length === 0) { cleanupFiles(temporaryFiles); await interaction.editReply('⚠️ VC音声を要約用に変換できませんでした。'); return; }

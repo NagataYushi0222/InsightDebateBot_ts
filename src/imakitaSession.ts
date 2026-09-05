@@ -30,7 +30,7 @@ export class ImakitaSession {
         this.detach = attachVoiceCaptureConsumer(connection, {
             consumerLabel: `imakita:${guild.id}`,
             onSpeakerStart: (id) => { const member = guild.members.cache.get(id); if (member) this.users.set(id, member.displayName); },
-            onAudio: (id, pcm) => { if (this.isRecording && this.recorder) this.recorder.write(id, pcm); },
+            onOpus: (id, opus) => { if (this.isRecording && this.recorder) this.recorder.writeOpus(id, opus); },
         });
         this.timer = setInterval(() => { void this.flush(); }, CHUNK_MS);
     }

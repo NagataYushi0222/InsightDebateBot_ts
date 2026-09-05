@@ -4,13 +4,12 @@ import {
     VoiceConnection,
     VoiceConnectionStatus,
 } from '@ovencord/voice';
-import { OpusDecoder } from './opusDecoder';
 import { ensureVoiceConnectionDiagnostics } from './voiceDiagnostics';
 import type { VoiceConsumerDiagnosticsSnapshot } from './voiceDiagnostics';
 
 export interface VoiceCaptureConsumer {
     consumerLabel: string;
-    onAudio(userId: string, pcmData: Buffer): void;
+    onOpus(userId: string, opusPacket: Buffer): void;
     onSpeakerStart?(userId: string): void;
     onStats?(stats: VoiceConsumerDiagnosticsSnapshot): void;
 }
@@ -18,7 +17,6 @@ export interface VoiceCaptureConsumer {
 class VoiceCaptureHub {
     private readonly consumers = new Set<VoiceCaptureConsumer>();
     private readonly activeReaders = new Map<string, ReadableStreamDefaultReader<Uint8Array | null>>();
-    private readonly decoders = new Map<string, OpusDecoder>();
     private readonly consumerBaselines = new Map<VoiceCaptureConsumer, Map<string, {
         daveDecryptFailures: number;
         daveDecryptSuccesses: number;
@@ -91,11 +89,6 @@ class VoiceCaptureHub {
     }
 
     private consumeUserStream(userId: string, opusStream: AudioReceiveStream): void {
-        if (!this.decoders.has(userId)) {
-            this.decoders.set(userId, new OpusDecoder());
-        }
-
-        const decoder = this.decoders.get(userId)!;
         const reader = opusStream.stream.getReader();
         this.activeReaders.set(userId, reader);
 
@@ -108,20 +101,11 @@ class VoiceCaptureHub {
                     }
 
                     this.diagnostics.recordOpusPacket(userId);
-                    const pcmData = decoder.decode(Buffer.from(value));
-                    if (!pcmData) {
-                        this.diagnostics.recordOpusDecodeFailure(userId);
-                        continue;
-                    }
+                    const opusPacket = Buffer.from(value);
 
                     for (const consumer of this.consumers) {
                         try {
-                            consumer.onAudio(userId, pcmData);
-                            this.diagnostics.recordPcmDelivery(
-                                userId,
-                                consumer.consumerLabel,
-                                pcmData.byteLength,
-                            );
+                            consumer.onOpus(userId, opusPacket);
                         } catch (error) {
                             console.error(`Voice capture consumer error for ${userId}:`, error);
                         }
@@ -136,8 +120,6 @@ class VoiceCaptureHub {
                 } catch {
                     // ignore release errors during shutdown
                 }
-                decoder.destroy();
-                this.decoders.delete(userId);
             }
         };
 
@@ -159,11 +141,6 @@ class VoiceCaptureHub {
         for (const reader of this.activeReaders.values()) {
             reader.cancel().catch(() => undefined);
         }
-        for (const decoder of this.decoders.values()) {
-            decoder.destroy();
-        }
-
-        this.decoders.clear();
         this.activeReaders.clear();
         this.consumerBaselines.clear();
         this.consumers.clear();
