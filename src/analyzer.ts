@@ -10,6 +10,8 @@ import {
     SearchTrace,
 } from './geminiWebSearch';
 
+const FILE_PROCESSING_TIMEOUT_MS = 180_000;
+
 interface SearchReferenceEntry {
     refId: string;
     title: string;
@@ -527,6 +529,7 @@ async function waitForFilesActive(
 ): Promise<void> {
     console.log('Waiting for file processing...');
     for (const fileRef of files) {
+        const deadline = Date.now() + FILE_PROCESSING_TIMEOUT_MS;
         while (true) {
             try {
                 const currentFile = await ai.files.get({ name: fileRef.name });
@@ -536,15 +539,31 @@ async function waitForFilesActive(
                 if (currentFile.state === 'FAILED') {
                     throw new Error(`File ${currentFile.name} failed to process`);
                 }
+                if (Date.now() >= deadline) {
+                    throw new Error(`File ${fileRef.name} processing timed out`);
+                }
                 process.stdout.write('.');
                 await new Promise((resolve) => setTimeout(resolve, 2000));
             } catch (e) {
+                // Gemini が明示した FAILED は一時的な files.get エラーではない。
+                if (e instanceof Error && /^File .* failed to process$/.test(e.message)) throw e;
                 console.error(`Error checking file state: ${e}`);
-                break;
+                // files.get 自体の失敗も、処理済みと見なして generateContent へ進めない。
+                throw e;
             }
         }
     }
     console.log('...all files ready');
+}
+
+function logGeminiRequestError(context: string, error: any): void {
+    const source = error?.error ?? error?.response?.data?.error ?? error ?? {};
+    console.error(`[Gemini] ${context}`, {
+        status: source.status ?? error?.status,
+        code: source.code ?? error?.code,
+        message: source.message ?? error?.message ?? String(error),
+        details: source.details ?? error?.details,
+    });
 }
 
 async function generateStructuredMemory(
@@ -587,7 +606,7 @@ async function generateStructuredMemory(
 
 /**
  * 議論を分析するメイン関数
- * @param audioFilesMap ユーザーID → MP3ファイルパスのマップ
+ * @param audioFilesMap ユーザーID → Ogg/Opusファイルパスのマップ
  * @param previousMemory 前回の構造化メモ
  * @param userMap ユーザーID → 表示名のマップ
  * @param apiKey APIキー（オプション、設定されていない場合は環境変数を使用）
@@ -627,6 +646,7 @@ export async function analyzeDiscussion(
     }
 
     const uploadedFiles: any[] = [];
+    const uploadedAudioFiles: Array<{ filePath: string; fileRef: any }> = [];
 
     // プロンプト決定
     const systemPrompt = PROMPTS[mode] || PROMPTS['debate'];
@@ -663,12 +683,13 @@ export async function analyzeDiscussion(
         try {
             const uploadedFile = await uploadToGemini(ai, filePath);
             uploadedFiles.push(uploadedFile);
+            uploadedAudioFiles.push({ filePath, fileRef: uploadedFile });
 
             parts.push({ text: `発言者ラベル: ${userName} [ID:${userId}]` });
             parts.push({
                 fileData: {
                     fileUri: uploadedFile.uri,
-                    mimeType: uploadedFile.mimeType,
+                    mimeType: 'audio/ogg',
                 },
             });
         } catch (e) {
@@ -689,6 +710,16 @@ export async function analyzeDiscussion(
 
         // Gemini APIで分析実行（検索は function calling で付与）
         console.log(`[Analyzer] 使用モデル: ${useModel}`);
+        for (const { filePath, fileRef } of uploadedAudioFiles) {
+            console.log('[Gemini] Ready audio file', {
+                audioPath: filePath,
+                audioFileSize: fs.statSync(filePath).size,
+                mimeType: 'audio/ogg',
+                geminiFilesApiState: 'ACTIVE',
+                geminiFileUri: fileRef.uri,
+                modelName: useModel,
+            });
+        }
 
         const isThinkingModel = isGeminiThinkingModel(useModel);
 
@@ -739,7 +770,7 @@ export async function analyzeDiscussion(
             }
         }
 
-        console.error(`Analysis Error: ${e}`);
+        logGeminiRequestError('analysis failed', e);
         return {
             report: normalizeAnalysisError(e),
             memory: previousMemory,

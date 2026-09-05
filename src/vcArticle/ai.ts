@@ -179,6 +179,33 @@ async function waitForFilesActive(
     }
 }
 
+function logGeminiAudioRequest(
+    uploadedAudioFiles: Array<{ filePath: string; fileRef: any }>,
+    modelName: string,
+): void {
+    for (const { filePath, fileRef } of uploadedAudioFiles) {
+        if (!fs.existsSync(filePath)) continue;
+        console.log('[Gemini] Ready audio file', {
+            audioPath: filePath,
+            audioFileSize: fs.statSync(filePath).size,
+            mimeType: 'audio/ogg',
+            geminiFilesApiState: 'ACTIVE',
+            geminiFileUri: fileRef.uri,
+            modelName,
+        });
+    }
+}
+
+function logGeminiRequestError(context: string, error: any): void {
+    const source = error?.error ?? error?.response?.data?.error ?? error ?? {};
+    console.error(`[Gemini] ${context}`, {
+        status: source.status ?? error?.status,
+        code: source.code ?? error?.code,
+        message: source.message ?? error?.message ?? String(error),
+        details: source.details ?? error?.details,
+    });
+}
+
 function createAiClient(apiKey: string | null): GoogleGenAI {
     const useKey = apiKey || GEMINI_API_KEY;
     if (!useKey) {
@@ -230,9 +257,14 @@ async function uploadAudioParts(
     ai: GoogleGenAI,
     audioClips: StoredAudioClip[],
     onProgress?: ArticleProgressReporter,
-): Promise<{ uploadedFiles: any[]; audioParts: any[] }> {
+): Promise<{
+    uploadedFiles: any[];
+    audioParts: any[];
+    uploadedAudioFiles: Array<{ filePath: string; fileRef: any }>;
+}> {
     const uploadedFiles: any[] = [];
     const audioParts: any[] = [];
+    const uploadedAudioFiles: Array<{ filePath: string; fileRef: any }> = [];
 
     try {
         for (const [index, clip] of audioClips.entries()) {
@@ -246,13 +278,14 @@ async function uploadAudioParts(
 
             const uploadedFile = await uploadToGemini(ai, filePath);
             uploadedFiles.push(uploadedFile);
+            uploadedAudioFiles.push({ filePath, fileRef: uploadedFile });
 
             // 各音声ファイルの直前に話者ラベルを置いて、誰の発言かを対応づける。
             audioParts.push({ text: `発言者ラベル: ${displayName} [ID:${userId}] / 断片ID: ${clipId}` });
             audioParts.push({
                 fileData: {
                     fileUri: uploadedFile.uri,
-                    mimeType: uploadedFile.mimeType,
+                    mimeType: 'audio/ogg',
                 },
             });
         }
@@ -261,7 +294,7 @@ async function uploadAudioParts(
         throw error;
     }
 
-    return { uploadedFiles, audioParts };
+    return { uploadedFiles, audioParts, uploadedAudioFiles };
 }
 
 async function cleanupUploads(ai: GoogleGenAI, uploadedFiles: any[]): Promise<void> {
@@ -293,6 +326,7 @@ async function summarizeAudioClip(
 
     try {
         await waitForFilesActive(ai, [uploadedFile], onProgress);
+        logGeminiAudioRequest([{ filePath: clip.filePath, fileRef: uploadedFile }], useModel);
         const response = await withTimeout(
             ai.models.generateContent({
                 model: useModel,
@@ -305,7 +339,7 @@ async function summarizeAudioClip(
                             {
                                 fileData: {
                                     fileUri: uploadedFile.uri,
-                                    mimeType: uploadedFile.mimeType,
+                                    mimeType: 'audio/ogg',
                                 },
                             },
                         ],
@@ -320,7 +354,7 @@ async function summarizeAudioClip(
         );
         return toAudioClipDigest(response.text || '{}', clip);
     } catch (error) {
-        console.error(`[VC Article] Failed to summarize clip ${clip.clipId}:`, error);
+        logGeminiRequestError(`failed to summarize clip ${clip.clipId}`, error);
         return null;
     } finally {
         await cleanupUploads(ai, [uploadedFile]);
@@ -400,7 +434,7 @@ async function generateTopicExtractionResult(
         useWebSearch: boolean;
     },
 ): Promise<TopicExtractionResult> {
-    const { uploadedFiles, audioParts } = await uploadAudioParts(ai, audioClips, onProgress);
+    const { uploadedFiles, audioParts, uploadedAudioFiles } = await uploadAudioParts(ai, audioClips, onProgress);
 
     if (uploadedFiles.length === 0) {
         return { sessionSummary: '音声ファイルの準備に失敗しました。', topics: [] };
@@ -408,6 +442,7 @@ async function generateTopicExtractionResult(
 
     try {
         await waitForFilesActive(ai, uploadedFiles, onProgress);
+        logGeminiAudioRequest(uploadedAudioFiles, useModel);
 
         if (options.useWebSearch) {
             await reportProgress(onProgress, '🔎 Web 検索を使いながら記事候補を抽出しています...');
@@ -581,7 +616,7 @@ export async function generateArticleFromTopic(
 
     const ai = createAiClient(apiKey);
     const useModel = resolveGeminiModel(modelName);
-    const { uploadedFiles, audioParts } = await uploadAudioParts(ai, audioClips);
+    const { uploadedFiles, audioParts, uploadedAudioFiles } = await uploadAudioParts(ai, audioClips);
 
     if (uploadedFiles.length === 0) {
         return '記事生成に必要な音声ファイルの準備に失敗しました。';
@@ -589,6 +624,7 @@ export async function generateArticleFromTopic(
 
     try {
         await waitForFilesActive(ai, uploadedFiles);
+        logGeminiAudioRequest(uploadedAudioFiles, useModel);
 
         // 記事生成では、選ばれたトピック情報を追加して本文だけを返させる。
         const { response } = await generateContentWithWebSearch(

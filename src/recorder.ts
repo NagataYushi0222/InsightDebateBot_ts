@@ -22,6 +22,9 @@ export class UserAudioRecorder {
      * ユーザーのPCMデータをファイルに書き込み
      */
     writeOpus(userId: string, opusPacket: Buffer): void {
+        // Discord 側の終端通知等を音声 packet として mux しない。
+        if (opusPacket.length === 0) return;
+
         let stream = this.writeStreams.get(userId);
 
         if (!stream) {
@@ -42,7 +45,8 @@ export class UserAudioRecorder {
             });
         }
 
-        stream.write(this.muxers.get(userId)!.packet(opusPacket));
+        const page = this.muxers.get(userId)!.packet(opusPacket);
+        if (page.length > 0) stream.write(page);
     }
 
     /**
@@ -59,7 +63,9 @@ export class UserAudioRecorder {
             closePromises.push(new Promise((resolve) => {
                 stream.once('close', resolve);
                 stream.once('finish', resolve);
-                stream.end(this.muxers.get(userId)?.end());
+                const eosPage = this.muxers.get(userId)?.end() ?? Buffer.alloc(0);
+                if (eosPage.length > 0) stream.end(eosPage);
+                else stream.end();
             }));
 
             if (filePath) {

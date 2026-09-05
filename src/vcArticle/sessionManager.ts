@@ -480,22 +480,16 @@ export class VcArticleSession {
         const rawFiles = await this.recorder.flushAudio();
         if (rawFiles.size === 0) return;
 
-        const cleanupTargets: string[] = [];
-
-        for (const [userId, pcmPath] of rawFiles.entries()) {
-            cleanupTargets.push(pcmPath);
-            const mp3Path = pcmPath;
+        for (const [userId, oggPath] of rawFiles.entries()) {
 
             this.chunkSequence += 1;
             this.pendingAudioClips.push({
                 clipId: `${String(this.chunkSequence).padStart(4, '0')}_${Date.now()}`,
                 userId,
                 displayName: this.userMap.get(userId) || `User_${userId}`,
-                filePath: mp3Path,
+                filePath: oggPath,
             });
         }
-
-        cleanupFiles(cleanupTargets);
     }
 
     private detachFromVoiceCapture(): void {

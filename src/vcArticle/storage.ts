@@ -197,9 +197,9 @@ export function saveArchivedSession(params: {
         const { clipId, userId, displayName, filePath: sourcePath } = clip;
         if (!fs.existsSync(sourcePath)) continue;
 
-        // 一時保存された MP3 を、日付別アーカイブ配下へ移動して永続管理に切り替える。
+        // 一時保存された Ogg/Opus を、日付別アーカイブ配下へ移動して永続管理に切り替える。
         const safeName = sanitizeFileSegment(displayName);
-        const destinationName = `${safeName}_${userId}_${clipId}.mp3`;
+        const destinationName = `${safeName}_${userId}_${clipId}.ogg`;
         const destinationPath = path.join(sessionDir, destinationName);
         fs.renameSync(sourcePath, destinationPath);
 

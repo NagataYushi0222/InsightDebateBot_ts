@@ -15,6 +15,7 @@ const FETCH_LIMIT = 100;
 const SUMMARY_MESSAGE_LIMIT = 50;
 const SUMMARY_INPUT_MAX_LENGTH = 12_000;
 const SUMMARY_TIMEOUT_MS = 45_000;
+const FILE_PROCESSING_TIMEOUT_MS = 180_000;
 
 function logPerformance(guildId: string, requestId: string, stage: string, startedAt: number, extra: Record<string, unknown> = {}): void {
     console.log(JSON.stringify({
@@ -44,6 +45,33 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
                 reject(error);
             },
         );
+    });
+}
+
+async function waitForFilesActive(ai: GoogleGenAI, files: any[]): Promise<void> {
+    for (const fileRef of files) {
+        const deadline = Date.now() + FILE_PROCESSING_TIMEOUT_MS;
+        while (true) {
+            const currentFile = await ai.files.get({ name: fileRef.name });
+            if (currentFile.state === 'ACTIVE') break;
+            if (currentFile.state === 'FAILED') {
+                throw new Error(`Gemini failed to process uploaded audio file: ${currentFile.name}`);
+            }
+            if (Date.now() >= deadline) {
+                throw new Error(`Gemini audio file processing timed out: ${fileRef.name}`);
+            }
+            await new Promise((resolve) => setTimeout(resolve, 2000));
+        }
+    }
+}
+
+function logGeminiRequestError(context: string, error: any): void {
+    const source = error?.error ?? error?.response?.data?.error ?? error ?? {};
+    console.error(`[Gemini] ${context}`, {
+        status: source.status ?? error?.status,
+        code: source.code ?? error?.code,
+        message: source.message ?? error?.message ?? String(error),
+        details: source.details ?? error?.details,
     });
 }
 
@@ -149,6 +177,19 @@ export async function handleImakitaCommand(
             });
         }
         if (uploadedFiles.length === 0) { cleanupFiles(temporaryFiles); await interaction.editReply('⚠️ VC音声を要約用に変換できませんでした。'); return; }
+        await waitForFilesActive(ai, uploadedFiles);
+        for (const [index, file] of uploadedFiles.entries()) {
+            const filePath = clips[index]?.filePath;
+            if (!filePath || !fs.existsSync(filePath)) continue;
+            console.log('[Gemini] Ready audio file', {
+                audioPath: filePath,
+                audioFileSize: fs.statSync(filePath).size,
+                mimeType: 'audio/ogg',
+                geminiFilesApiState: 'ACTIVE',
+                geminiFileUri: file.uri,
+                modelName,
+            });
+        }
         const generationStartedAt = Date.now();
         const response = await withTimeout(ai.models.generateContent({
             model: modelName,
@@ -164,7 +205,7 @@ export async function handleImakitaCommand(
                         '会話ログ:',
                         conversation,
                     ].join('\n'),
-                }, ...uploadedFiles.map((file) => ({ fileData: { fileUri: file.uri, mimeType: file.mimeType } }))],
+                }, ...uploadedFiles.map((file) => ({ fileData: { fileUri: file.uri, mimeType: 'audio/ogg' } }))],
             }],
             config: {
                 maxOutputTokens: 350,
@@ -185,7 +226,7 @@ export async function handleImakitaCommand(
             logPerformance(guildId, requestId, 'finished', startedAt, { uploadedFileCount: uploadedFiles.length });
         }
     } catch (error) {
-        console.error('[Imakita] Failed to generate summary:', error);
+        logGeminiRequestError('imakita summary failed', error);
         const message = error instanceof Error ? error.message : String(error);
         await interaction.editReply(
             message.includes('タイムアウト')

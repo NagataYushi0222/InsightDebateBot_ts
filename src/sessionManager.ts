@@ -605,8 +605,8 @@ hasActiveConnection(): boolean {
                 userMap.set(userId, displayName);
             }
 
-            // PCM → MP3 変換
-            const userFilesMp3 = new Map<string, string>();
+            // Ogg/Opus は再エンコードせず、そのまま Gemini File API へ渡す。
+            const userFilesOgg = new Map<string, string>();
             const filesToCleanup: string[] = [...audioBatch.generatedRawFiles];
             let reportPosted = false;
             this.currentTaskLabel = audioBatch.hadRetainedAudio
@@ -616,11 +616,11 @@ hasActiveConnection(): boolean {
 
 await Promise.all(
                 Array.from(audioBatch.analysisRawFiles.entries()).map(async ([userId, rawPath]) => {
-                    userFilesMp3.set(userId, rawPath);
+                    userFilesOgg.set(userId, rawPath);
                 }),
             );
 
-            if (userFilesMp3.size !== audioBatch.analysisRawFiles.size) {
+            if (userFilesOgg.size !== audioBatch.analysisRawFiles.size) {
                 this.retainRawAudioFiles(audioBatch.sourceRawFilesByUser);
                 cleanupFiles(filesToCleanup);
                 if (this.targetTextChannel) {
@@ -659,7 +659,7 @@ await Promise.all(
                 this.currentTaskLabel = '回答生成中';
                 await this.refreshStatusMessage(undefined, true);
                 const analysisResult = await analyzeDiscussion(
-                    userFilesMp3,
+                    userFilesOgg,
                     this.structuredMemory,
                     userMap,
                     apiKeyToUse,
