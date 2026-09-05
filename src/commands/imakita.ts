@@ -1,4 +1,5 @@
 import { GoogleGenAI } from '@google/genai';
+import fs from 'fs';
 import {
     ChatInputCommandInteraction,
     Message,
@@ -14,6 +15,17 @@ const FETCH_LIMIT = 100;
 const SUMMARY_MESSAGE_LIMIT = 50;
 const SUMMARY_INPUT_MAX_LENGTH = 12_000;
 const SUMMARY_TIMEOUT_MS = 45_000;
+
+function logPerformance(guildId: string, requestId: string, stage: string, startedAt: number, extra: Record<string, unknown> = {}): void {
+    console.log(JSON.stringify({
+        event: 'imakita_performance',
+        guildId,
+        requestId,
+        stage,
+        elapsedMs: Date.now() - startedAt,
+        ...extra,
+    }));
+}
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
     return new Promise((resolve, reject) => {
@@ -94,6 +106,9 @@ export async function handleImakitaCommand(
     }
 
     await interaction.deferReply();
+    const requestId = `${interaction.id.slice(-8)}_${Date.now().toString(36)}`;
+    const startedAt = Date.now();
+    logPerformance(guildId, requestId, 'started', startedAt);
 
     try {
         const session = imakitaManager.getSession(guildId);
@@ -106,7 +121,16 @@ export async function handleImakitaCommand(
             .filter((message) => message.createdTimestamp >= Date.now() - 10 * 60 * 1000)
             .sort((a, b) => a.createdTimestamp - b.createdTimestamp);
         const conversation = buildConversation(chronologicalMessages);
+        logPerformance(guildId, requestId, 'chat_collected', startedAt, {
+            messageCount: chronologicalMessages.length,
+            chatCharacters: conversation.length,
+        });
         const clips = await session.getRecentClips();
+        logPerformance(guildId, requestId, 'audio_collected', startedAt, {
+            clipCount: clips.length,
+            audioBytes: clips.reduce((total, clip) => total + fs.statSync(clip.filePath).size, 0),
+            speakerCount: new Set(clips.map((clip) => clip.userId)).size,
+        });
         if (clips.length === 0) { await interaction.editReply('📰 **今北産業**\n・直近10分に要約できるVC音声がありません。'); return; }
         await interaction.editReply('🎧 直近10分のVC音声とチャットを要約しています...');
 
@@ -116,10 +140,16 @@ export async function handleImakitaCommand(
         const uploadedFiles: any[] = [];
         try {
         for (const clip of clips) {
+            const uploadStartedAt = Date.now();
             const uploaded = await ai.files.upload({ file: clip.filePath, config: { mimeType: 'audio/ogg' } });
             uploadedFiles.push(uploaded);
+            logPerformance(guildId, requestId, 'file_uploaded', uploadStartedAt, {
+                clipBytes: fs.statSync(clip.filePath).size,
+                uploadedFileCount: uploadedFiles.length,
+            });
         }
         if (uploadedFiles.length === 0) { cleanupFiles(temporaryFiles); await interaction.editReply('⚠️ VC音声を要約用に変換できませんでした。'); return; }
+        const generationStartedAt = Date.now();
         const response = await withTimeout(ai.models.generateContent({
             model: modelName,
             contents: [{
@@ -143,11 +173,16 @@ export async function handleImakitaCommand(
                     : {}),
             },
         }), SUMMARY_TIMEOUT_MS);
+        logPerformance(guildId, requestId, 'generation_completed', generationStartedAt, {
+            modelName,
+            responseCharacters: response.text?.length || 0,
+        });
 
         await interaction.editReply(normalizeSummary(response.text || ''));
         } finally {
             await Promise.all(uploadedFiles.map((file) => ai.files.delete({ name: file.name }).catch(() => undefined)));
             cleanupFiles(temporaryFiles);
+            logPerformance(guildId, requestId, 'finished', startedAt, { uploadedFileCount: uploadedFiles.length });
         }
     } catch (error) {
         console.error('[Imakita] Failed to generate summary:', error);
@@ -157,5 +192,6 @@ export async function handleImakitaCommand(
                 ? '⚠️ 今北産業の要約に時間がかかっています。少し待ってからもう一度 `/imakita` を実行してください。'
                 : `⚠️ 今北産業の要約に失敗しました: ${message}`,
         );
+        logPerformance(guildId, requestId, 'failed', startedAt, { error: message.slice(0, 300) });
     }
 }
