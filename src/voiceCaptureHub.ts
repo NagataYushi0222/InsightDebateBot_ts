@@ -6,6 +6,7 @@ import {
 } from '@ovencord/voice';
 import { ensureVoiceConnectionDiagnostics } from './voiceDiagnostics';
 import type { VoiceConsumerDiagnosticsSnapshot } from './voiceDiagnostics';
+import type { ReadableStreamDefaultReader as NodeReadableStreamDefaultReader } from 'node:stream/web';
 
 export interface VoiceCaptureConsumer {
     consumerLabel: string;
@@ -16,14 +17,11 @@ export interface VoiceCaptureConsumer {
 
 class VoiceCaptureHub {
     private readonly consumers = new Set<VoiceCaptureConsumer>();
-    private readonly activeReaders = new Map<string, ReadableStreamDefaultReader<Uint8Array | null>>();
+    private readonly activeReaders = new Map<string, NodeReadableStreamDefaultReader<Uint8Array | null>>();
     private readonly consumerBaselines = new Map<VoiceCaptureConsumer, Map<string, {
         daveDecryptFailures: number;
         daveDecryptSuccesses: number;
         opusPacketsReceived: number;
-        opusDecodeFailures: number;
-        pcmPacketsDelivered: number;
-        pcmBytesDelivered: number;
     }>>();
     private readonly diagnostics;
     private isDisposed = false;

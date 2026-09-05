@@ -55,6 +55,13 @@ export interface AnalyzeDiscussionResult {
     modelName: string;
 }
 
+export interface DiscussionAudioInput {
+    userId: string;
+    segmentId: string;
+    partIndex: number;
+    filePath: string;
+}
+
 function normalizeAnalysisError(error: unknown): string {
     const message = error instanceof Error ? error.message : String(error);
 
@@ -71,7 +78,7 @@ function normalizeAnalysisError(error: unknown): string {
         return '⚠️ Web 検索を何度か試しましたが、有効な検索結果を十分に取得できませんでした。話題を少し絞るか、時間を置いて再試行してください。';
     }
 
-    return `分析中にエラーが発生しました: ${message}`;
+    return `⚠️ 分析中にエラーが発生しました: ${message}`;
 }
 
 function buildSearchReferenceEntries(searchTrace: SearchTrace[]): SearchReferenceEntry[] {
@@ -604,16 +611,59 @@ async function generateStructuredMemory(
     }
 }
 
+export async function uploadDiscussionAudioInputs(
+    ai: GoogleGenAI,
+    audioInputs: DiscussionAudioInput[],
+    userMap: Map<string, string> | null,
+): Promise<{
+    uploadedFiles: any[];
+    uploadedAudioFiles: Array<{ filePath: string; fileRef: any }>;
+    audioParts: any[];
+}> {
+    const uploadedFiles: any[] = [];
+    const uploadedAudioFiles: Array<{ filePath: string; fileRef: any }> = [];
+    const audioParts: any[] = [];
+
+    try {
+        for (const { userId, segmentId, partIndex, filePath } of audioInputs) {
+            if (!fs.existsSync(filePath)) {
+                throw new Error(`Required audio segment is missing: ${segmentId}`);
+            }
+            const uploadedFile = await uploadToGemini(ai, filePath);
+            uploadedFiles.push(uploadedFile);
+            uploadedAudioFiles.push({ filePath, fileRef: uploadedFile });
+
+            const userName = userMap?.get(userId) || `User_${userId}`;
+            audioParts.push({
+                text: `発言者ラベル: ${userName} [ID:${userId}] / segment=${segmentId} / part=${partIndex}`,
+            });
+            audioParts.push({
+                fileData: {
+                    fileUri: uploadedFile.uri,
+                    mimeType: 'audio/ogg',
+                },
+            });
+        }
+    } catch (error) {
+        await Promise.all(
+            uploadedFiles.map((file) => ai.files.delete({ name: file.name }).catch(() => undefined)),
+        );
+        throw error;
+    }
+
+    return { uploadedFiles, uploadedAudioFiles, audioParts };
+}
+
 /**
  * 議論を分析するメイン関数
- * @param audioFilesMap ユーザーID → Ogg/Opusファイルパスのマップ
+ * @param audioInputs Discord user IDとsegment identityを分離したOgg/Opus入力
  * @param previousMemory 前回の構造化メモ
  * @param userMap ユーザーID → 表示名のマップ
  * @param apiKey APIキー（オプション、設定されていない場合は環境変数を使用）
  * @param mode 分析モード（"debate" | "summary"）
  */
 export async function analyzeDiscussion(
-    audioFilesMap: Map<string, string>,
+    audioInputs: DiscussionAudioInput[],
     previousMemory: StructuredDiscussionMemory | null = null,
     userMap: Map<string, string> | null = null,
     apiKey: string | null = null,
@@ -667,34 +717,28 @@ export async function analyzeDiscussion(
         text: `${formatMemoryForPrompt(previousMemory)}\n---\n今回の議論:`,
     });
 
+    const participantIds = [...new Set(audioInputs.map(({ userId }) => userId))];
+
     // 音声ファイルをアップロードして追加
     parts.push({
-        text: `今回の参加者一覧:\n${Array.from(audioFilesMap.keys()).map((userId, index) => {
+        text: `今回の参加者一覧:\n${participantIds.map((userId, index) => {
             const userName = userMap?.get(userId) || `User_${userId}`;
             return `${index + 1}. ${userName} [ID:${userId}]`;
         }).join('\n')}`,
     });
 
-    for (const [userId, filePath] of audioFilesMap.entries()) {
-        if (!fs.existsSync(filePath)) continue;
-
-        const userName = userMap?.get(userId) || `User_${userId}`;
-
-        try {
-            const uploadedFile = await uploadToGemini(ai, filePath);
-            uploadedFiles.push(uploadedFile);
-            uploadedAudioFiles.push({ filePath, fileRef: uploadedFile });
-
-            parts.push({ text: `発言者ラベル: ${userName} [ID:${userId}]` });
-            parts.push({
-                fileData: {
-                    fileUri: uploadedFile.uri,
-                    mimeType: 'audio/ogg',
-                },
-            });
-        } catch (e) {
-            console.error(`Skipping file ${filePath} due to upload error: ${e}`);
-        }
+    try {
+        const uploaded = await uploadDiscussionAudioInputs(ai, audioInputs, userMap);
+        uploadedFiles.push(...uploaded.uploadedFiles);
+        uploadedAudioFiles.push(...uploaded.uploadedAudioFiles);
+        parts.push(...uploaded.audioParts);
+    } catch (error) {
+        logGeminiRequestError('required audio upload failed; analysis aborted', error);
+        return {
+            report: normalizeAnalysisError(error),
+            memory: previousMemory,
+            modelName: useModel,
+        };
     }
 
     if (uploadedFiles.length === 0) {

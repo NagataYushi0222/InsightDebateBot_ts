@@ -269,7 +269,9 @@ async function uploadAudioParts(
     try {
         for (const [index, clip] of audioClips.entries()) {
             const { userId, displayName, filePath, clipId } = clip;
-            if (!fs.existsSync(filePath)) continue;
+            if (!fs.existsSync(filePath)) {
+                throw new Error(`Required audio segment is missing: ${clipId}`);
+            }
 
             await reportProgress(
                 onProgress,
@@ -312,9 +314,9 @@ async function summarizeAudioClip(
     index: number,
     total: number,
     onProgress?: ArticleProgressReporter,
-): Promise<AudioClipDigest | null> {
+): Promise<AudioClipDigest> {
     if (!fs.existsSync(clip.filePath)) {
-        return null;
+        throw new Error(`Required audio segment is missing: ${clip.clipId}`);
     }
 
     await reportProgress(
@@ -355,7 +357,7 @@ async function summarizeAudioClip(
         return toAudioClipDigest(response.text || '{}', clip);
     } catch (error) {
         logGeminiRequestError(`failed to summarize clip ${clip.clipId}`, error);
-        return null;
+        throw error;
     } finally {
         await cleanupUploads(ai, [uploadedFile]);
     }
@@ -573,13 +575,11 @@ export async function extractArticleTopics(
             onProgress,
             '🧯 最後の手段として音声断片を個別に要約し、記事候補を再構成しています...',
         );
-        const digests = (
-            await Promise.all(
-                audioClips.map((clip, index) =>
-                    summarizeAudioClip(ai, useModel, clip, index, audioClips.length, onProgress),
-                ),
-            )
-        ).filter((digest): digest is AudioClipDigest => digest !== null);
+        const digests = await Promise.all(
+            audioClips.map((clip, index) =>
+                summarizeAudioClip(ai, useModel, clip, index, audioClips.length, onProgress),
+            ),
+        );
 
         const digestResult = await extractTopicsFromDigests(
             ai,

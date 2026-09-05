@@ -215,6 +215,7 @@ export class SharedVoiceCoordinator {
                 });
                 this.sessionManager.cleanupDestroyedConnection(guildId, connection);
                 this.vcArticleManager.cleanupDestroyedConnection(guildId, connection);
+                this.imakitaManager.cleanupDestroyedConnection(guildId, connection);
             }
             if (newState.status === VoiceConnectionStatus.Ready) {
                 this.syncParticipantsForConnection(guildId, connection);

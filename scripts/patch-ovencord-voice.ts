@@ -18,6 +18,11 @@ const patches = [
         target: path.resolve('node_modules/@ovencord/voice/src/receive/VoiceReceiver.ts'),
         transforms: <Transform[]>[
             {
+                kind: 'literal',
+                from: '// @ts-expect-error - TS may fail to resolve the export map',
+                to: '// @ts-ignore - upstream export map annotation is version-sensitive',
+            },
+            {
                 kind: 'regex',
                 from: /@noble\/ciphers\/aes(?!(?:\.js)+)/g,
                 to: "@noble/ciphers/aes.js",
@@ -33,6 +38,11 @@ const patches = [
         target: path.resolve('node_modules/@ovencord/voice/src/networking/Networking.ts'),
         transforms: <Transform[]>[
             {
+                kind: 'literal',
+                from: '// @ts-expect-error - TS may fail to resolve the export map',
+                to: '// @ts-ignore - upstream export map annotation is version-sensitive',
+            },
+            {
                 kind: 'regex',
                 from: /@noble\/ciphers\/aes(?!(?:\.js)+)/g,
                 to: "@noble/ciphers/aes.js",
@@ -41,6 +51,16 @@ const patches = [
                 kind: 'regex',
                 from: /const cipher = gcm\(secretKey, connectionData\.nonceBuffer\);\s+encrypted = cipher\.encrypt\(uintPacket, additionalData\);/g,
                 to: "const cipher = gcm(secretKey, connectionData.nonceBuffer, additionalData);\n\t\t\t\tencrypted = cipher.encrypt(uintPacket);",
+            },
+        ],
+    },
+    {
+        target: path.resolve('node_modules/@ovencord/voice/src/networking/DAVESession.ts'),
+        transforms: <Transform[]>[
+            {
+                kind: 'literal',
+                from: '// @ts-expect-error - const enum is exported and works (todo: drop const modifier on Davey end)',
+                to: '// @ts-ignore - upstream Davey enum annotation is version-sensitive',
             },
         ],
     },

@@ -95,6 +95,7 @@ const analyzeModeEnvironment: AnalyzeModeEnvironment = {
                     reason: '音声接続が破棄されたため',
                 });
                 sessionManager.cleanupDestroyedConnection(guildId, connection);
+                imakitaManager.cleanupDestroyedConnection(guildId, connection);
             }
 
             if (newState.status === VoiceConnectionStatus.Ready) {

@@ -31,6 +31,8 @@ venv/
 
 # Project Specific
 temp_audio/
+bot_settings.db
+bot_settings.db-*
 *.pcm
 *.mp3
 *.wav

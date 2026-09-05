@@ -1,16 +1,32 @@
 import { Database } from 'bun:sqlite';
+import fs from 'fs';
 import path from 'path';
 
 const DB_PATH = path.resolve('bot_settings.db');
 
 let db: Database;
 
+function secureDatabaseFiles(): void {
+    if (process.platform === 'win32') return;
+
+    for (const filePath of [DB_PATH, `${DB_PATH}-wal`, `${DB_PATH}-shm`]) {
+        if (!fs.existsSync(filePath)) continue;
+        try {
+            fs.chmodSync(filePath, 0o600);
+        } catch (error) {
+            console.warn(`Could not restrict database permissions for ${path.basename(filePath)}:`, error);
+        }
+    }
+}
+
 function getConnection(): Database {
     if (!db) {
         db = new Database(DB_PATH);
+        secureDatabaseFiles();
         db.run('PRAGMA journal_mode = WAL');
         db.run('PRAGMA busy_timeout = 5000');
         db.run('PRAGMA synchronous = NORMAL');
+        secureDatabaseFiles();
     }
     return db;
 }
@@ -67,6 +83,7 @@ export function initDb(): void {
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
   `);
+    secureDatabaseFiles();
 }
 
 export function getGuildSettings(guildId: string): GuildSettings {

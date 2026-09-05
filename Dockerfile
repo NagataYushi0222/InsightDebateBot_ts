@@ -5,10 +5,8 @@ FROM oven/bun:1-slim
 WORKDIR /app
 
 # システム依存関係をインストール
-# - ffmpeg: 音声処理に必要
-# - ca-certificates: SSL証明書
+# 本番音声経路はOpusを再エンコードしないためffmpegは不要。
 RUN apt-get update && apt-get install -y \
-    ffmpeg \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 

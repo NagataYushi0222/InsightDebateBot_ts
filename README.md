@@ -10,7 +10,7 @@ Discord のボイスチャットを録音し、Gemini で定期分析や最終�
 - 同じ VC で要約モードと VC 記事化モードを同時利用可能
 - VC 会話から記事候補トピックを抽出し、ニュース風の記事を生成
 - 記事化用音声を日時ごとに保存し、一覧表示や再読み込みに対応
-- 記事化録音は約15分ごとに区切って MP3 化
+- 記事化録音は約15分ごとにOgg/Opusとして区切り、再エンコードせず保存
 - Gemini の function calling 経由で Web 検索を呼び出すファクトチェック対応
 - 軽量構成で Linux サーバーや OCI でも運用しやすい
 - Slash Command で操作可能
@@ -93,7 +93,7 @@ Gemini API の利用上限は API キーではなく Google Cloud プロジェ�
 ## 必要なもの
 
 - Bun
-- FFmpeg
+- FFmpeg / ffprobe（Ogg integration testを実行する開発環境のみ）
 - Discord Bot Token
 - Gemini API Key
 
@@ -137,7 +137,7 @@ Windows PowerShell:
 powershell -c "irm bun.sh/install.ps1 | iex"
 ```
 
-### 2. FFmpeg のインストール
+### 2. FFmpeg のインストール（integration testを実行する場合のみ）
 
 macOS:
 
@@ -272,8 +272,8 @@ pkill -f "bun run src/index_with_vc_article.ts"
 
 - 保存先は `temp_audio/vc_article_archive/YYYY-MM-DD/<archive_id>/` です
 - 音声はユーザーごとに別ファイルで保存されます
-- 長時間VCに対応するため、録音中に約15分ごとで区切って PCM から MP3 へ変換します
-- そのため、1人の参加者について複数のMP3断片が保存されることがあります
+- 長時間VCに対応するため、録音中に約15分ごとのOgg/Opus断片へ区切ります
+- そのため、1人の参加者について複数のOgg音声断片が保存されることがあります
 - 保存済みアーカイブは7日で期限切れになり、次回アクセス時に自動削除されます
 - 一度概要を生成したアーカイブには、概要先頭20文字程度のタイトルが付き、`/article_archives` で見やすく表示されます
 - `/article_stop` で生成した記事候補はアーカイブに保存され、`/article_load` で再利用されます

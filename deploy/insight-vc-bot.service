@@ -5,6 +5,7 @@ After=network.target
 [Service]
 Type=simple
 User=ubuntu
+UMask=0077
 WorkingDirectory=/home/ubuntu/InsightDebateBot
 Environment=PATH=/home/ubuntu/.bun/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/home/ubuntu/.bun/bin/bun run src/index_with_vc_article.ts

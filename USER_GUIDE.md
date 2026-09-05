@@ -40,24 +40,23 @@ VPSや自宅サーバーで24時間稼働させたい場合は、この方法が
 ---
 
 ## 💻 方法3: ソースコードから動かす（開発者向け）
-Python環境がある方は、直接コードを実行できます。
+Bun環境がある方は、TypeScript版を直接実行できます。
 
 ### 必要なもの
-- Python 3.10以上
+- Bun
 - git
-- ffmpeg (macなら `brew install ffmpeg`, winなら公式サイトから)
 
 ### 手順
 1. 準備
    ```bash
-   git clone https://github.com/NagataYushi0222/InsightDebateBot.git
-   cd InsightDebateBot
-   pip install -r insight_bot/requirements.txt
+   git clone https://github.com/NagataYushi0222/InsightDebateBot_ts.git
+   cd InsightDebateBot_ts
+   bun install
    ```
 
 2. 起動
    ```bash
-   python main.py
+   bun run src/index_with_vc_article.ts
    ```
    
 3. 設定

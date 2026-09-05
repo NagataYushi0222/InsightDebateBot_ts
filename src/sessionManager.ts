@@ -7,7 +7,7 @@ import path from 'path';
 import { Client, TextChannel, Guild, Message } from 'discord.js';
 import { UserAudioRecorder } from './recorder';
 import { cleanupFiles } from './audioProcessor';
-import { analyzeDiscussion, StructuredDiscussionMemory } from './analyzer';
+import { analyzeDiscussion, DiscussionAudioInput, StructuredDiscussionMemory } from './analyzer';
 import { getGeminiModelDisplayName, resolveGeminiModel, TEMP_AUDIO_DIR } from './config';
 import { getGuildSettings, GuildSettings } from './database';
 import { attachVoiceCaptureConsumer } from './voiceCaptureHub';
@@ -35,10 +35,9 @@ export interface AnalyzeStatusSummary {
 }
 
 interface PreparedAudioBatch {
-    analysisRawFiles: Map<string, string>;
+    analysisAudioInputs: DiscussionAudioInput[];
     sourceRawFilesByUser: Map<string, string[]>;
     sourceRawFiles: string[];
-    generatedRawFiles: string[];
     hadRetainedAudio: boolean;
     retainedSegmentCount: number;
 }
@@ -217,6 +216,9 @@ hasActiveConnection(): boolean {
     handleDestroyedConnection(connection: VoiceConnection): boolean {
         if (this.voiceConnection !== connection) return false;
 
+        const recorder = this.recorder;
+        const processing = this.processingPromise;
+
         this.isProcessLoopRunning = false;
         this.isRecording = false;
         this.isStopping = false;
@@ -226,6 +228,16 @@ hasActiveConnection(): boolean {
         this.logVoiceStats('connection_destroyed');
         this.voiceConnection = null;
         this.recorder = null;
+        const finishProcessing = processing?.catch(() => undefined) ?? Promise.resolve();
+        void finishProcessing
+            .then(async () => {
+                await recorder?.discard();
+                // 切断と競合した分析が後から保持した音声も残さない。
+                this.discardRetainedRawAudioFiles();
+            })
+            .catch((error) => {
+                console.error(`[${this.guildId}] Failed to discard recorder after destroyed connection:`, error);
+            });
         this.processingPromise = null;
         this.activeDialogueTheme = null;
         this.discardRetainedRawAudioFiles();
@@ -281,6 +293,7 @@ hasActiveConnection(): boolean {
             }
 
             if (skipFinal) {
+                await this.recorder?.discard();
                 this.discardRetainedRawAudioFiles();
             }
 
@@ -410,43 +423,6 @@ hasActiveConnection(): boolean {
         this.retainedAudioIncludedSegmentCount = 0;
     }
 
-    private async concatenateRawAudioFiles(filePaths: string[], outputPath: string): Promise<void> {
-        await new Promise<void>((resolve, reject) => {
-            const output = fs.createWriteStream(outputPath);
-            let settled = false;
-            let index = 0;
-
-            const fail = (error: unknown) => {
-                if (settled) return;
-                settled = true;
-                output.destroy();
-                reject(error);
-            };
-
-            const pipeNext = () => {
-                if (settled) return;
-                if (index >= filePaths.length) {
-                    output.end();
-                    return;
-                }
-
-                const input = fs.createReadStream(filePaths[index++]);
-                input.once('error', fail);
-                input.once('end', pipeNext);
-                input.pipe(output, { end: false });
-            };
-
-            output.once('error', fail);
-            output.once('finish', () => {
-                if (settled) return;
-                settled = true;
-                resolve();
-            });
-
-            pipeNext();
-        });
-    }
-
     private buildSourceRawFilesByUser(currentRawFiles: Map<string, string>): Map<string, string[]> {
         const sourceRawFilesByUser = new Map<string, string[]>();
 
@@ -478,22 +454,22 @@ hasActiveConnection(): boolean {
         const sourceRawFilesByUser = this.buildSourceRawFilesByUser(currentRawFiles);
         const retainedSegmentCount = this.getRetainedAudioSegmentCount();
 
-        const analysisRawFiles = new Map<string, string>();
-        const generatedRawFiles: string[] = [];
+        const analysisAudioInputs: DiscussionAudioInput[] = [];
 
         for (const [userId, files] of sourceRawFilesByUser.entries()) {
             // Oggコンテナはバイト連結できないため、再試行分も独立したGemini音声Partとして渡す。
-            files.forEach((filePath, index) => analysisRawFiles.set(
-                files.length === 1 ? userId : `${userId}__part${index + 1}`,
+            files.forEach((filePath, index) => analysisAudioInputs.push({
+                userId,
+                segmentId: `${userId}:${index + 1}`,
+                partIndex: index + 1,
                 filePath,
-            ));
+            }));
         }
 
         return {
-            analysisRawFiles,
+            analysisAudioInputs,
             sourceRawFilesByUser,
             sourceRawFiles: Array.from(sourceRawFilesByUser.values()).flat(),
-            generatedRawFiles,
             hadRetainedAudio: retainedSegmentCount > 0,
             retainedSegmentCount,
         };
@@ -563,9 +539,8 @@ hasActiveConnection(): boolean {
                 );
             }
 
-            if (audioBatch.analysisRawFiles.size === 0) {
+            if (audioBatch.analysisAudioInputs.length === 0) {
                 this.retainRawAudioFiles(audioBatch.sourceRawFilesByUser);
-                cleanupFiles(audioBatch.generatedRawFiles);
                 return;
             }
 
@@ -579,21 +554,21 @@ hasActiveConnection(): boolean {
                 // ignore
             }
 
-            for (const userId of audioBatch.analysisRawFiles.keys()) {
-                const discordUserId = userId.split('__part')[0];
-                let displayName = `User_${discordUserId}`;
+            const participantIds = [...new Set(audioBatch.analysisAudioInputs.map(({ userId }) => userId))];
+            for (const userId of participantIds) {
+                let displayName = `User_${userId}`;
 
                 if (guild) {
-                    const member = guild.members.cache.get(discordUserId);
+                    const member = guild.members.cache.get(userId);
                     if (member) {
                         displayName = member.displayName;
                     } else {
                         try {
-                            const fetchedMember = await guild.members.fetch(discordUserId);
+                            const fetchedMember = await guild.members.fetch(userId);
                             displayName = fetchedMember.displayName;
                         } catch {
                             try {
-                                const user = await this.bot.users.fetch(discordUserId);
+                                const user = await this.bot.users.fetch(userId);
                                 displayName = user.displayName;
                             } catch {
                                 // keep default
@@ -606,28 +581,11 @@ hasActiveConnection(): boolean {
             }
 
             // Ogg/Opus は再エンコードせず、そのまま Gemini File API へ渡す。
-            const userFilesOgg = new Map<string, string>();
-            const filesToCleanup: string[] = [...audioBatch.generatedRawFiles];
             let reportPosted = false;
             this.currentTaskLabel = audioBatch.hadRetainedAudio
-                ? `前回未出力の音声 ${audioBatch.retainedSegmentCount} 件を含めてエンコード中`
-                : 'エンコード中';
+                ? `前回未出力の音声 ${audioBatch.retainedSegmentCount} 件を含めて準備中`
+                : 'Ogg音声を準備中';
             await this.refreshStatusMessage(undefined, true);
-
-await Promise.all(
-                Array.from(audioBatch.analysisRawFiles.entries()).map(async ([userId, rawPath]) => {
-                    userFilesOgg.set(userId, rawPath);
-                }),
-            );
-
-            if (userFilesOgg.size !== audioBatch.analysisRawFiles.size) {
-                this.retainRawAudioFiles(audioBatch.sourceRawFilesByUser);
-                cleanupFiles(filesToCleanup);
-                if (this.targetTextChannel) {
-                    await this.targetTextChannel.send('⚠️ 音声ファイルの一部をエンコードできなかったため、今回の音声は次回レポートへ繰り越します。');
-                }
-                return;
-            }
 
                  // スレッドの作成とレポート送信
             const now = new Date();
@@ -659,7 +617,7 @@ await Promise.all(
                 this.currentTaskLabel = '回答生成中';
                 await this.refreshStatusMessage(undefined, true);
                 const analysisResult = await analyzeDiscussion(
-                    userFilesOgg,
+                    audioBatch.analysisAudioInputs,
                     this.structuredMemory,
                     userMap,
                     apiKeyToUse,
@@ -754,7 +712,6 @@ await Promise.all(
                     await this.targetTextChannel.send(`⚠️ エラー: ${e}`);
                 }
             } finally {
-                cleanupFiles(filesToCleanup);
                 if (reportPosted) {
                     cleanupFiles(audioBatch.sourceRawFiles);
                     this.clearRetainedRawAudioReferences();
@@ -869,9 +826,6 @@ await Promise.all(
                     `dave_ok=${user.daveDecryptSuccesses}`,
                     `dave_fail=${user.daveDecryptFailures}`,
                     `opus_ok=${user.opusPacketsReceived}`,
-                    `opus_decode_fail=${user.opusDecodeFailures}`,
-                    `pcm_packets=${user.pcmPacketsDelivered}`,
-                    `pcm_bytes=${user.pcmBytesDelivered}`,
                 ].join(' '),
             );
         }

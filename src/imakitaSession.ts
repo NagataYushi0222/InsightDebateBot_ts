@@ -32,7 +32,9 @@ export class ImakitaSession {
             onSpeakerStart: (id) => { const member = guild.members.cache.get(id); if (member) this.users.set(id, member.displayName); },
             onOpus: (id, opus) => { if (this.isRecording && this.recorder) this.recorder.writeOpus(id, opus); },
         });
-        this.timer = setInterval(() => { void this.flush(); }, CHUNK_MS);
+        this.timer = setInterval(() => {
+            void this.flush().catch((error) => console.error('[Imakita] Failed to flush audio chunk:', error));
+        }, CHUNK_MS);
     }
 
     private async flush(): Promise<void> {
@@ -57,11 +59,42 @@ export class ImakitaSession {
         if (this.timer) clearInterval(this.timer);
         this.timer = null;
         this.detach?.(); this.detach = null;
-        await this.flush();
-        cleanupFiles(this.clips.map((clip) => clip.filePath));
-        this.clips = []; this.recorder = null;
         const connection = this.voiceConnection; this.voiceConnection = null;
-        if (destroyConnection && connection && connection.state.status !== VoiceConnectionStatus.Destroyed) connection.destroy();
+        const recorder = this.recorder;
+        try {
+            await this.flush();
+        } finally {
+            await recorder?.discard();
+            cleanupFiles(this.clips.map((clip) => clip.filePath));
+            this.clips = [];
+            this.recorder = null;
+            if (destroyConnection && connection && connection.state.status !== VoiceConnectionStatus.Destroyed) {
+                connection.destroy();
+            }
+        }
+    }
+
+    handleDestroyedConnection(connection: VoiceConnection): boolean {
+        if (this.voiceConnection !== connection) return false;
+
+        this.isRecording = false;
+        if (this.timer) clearInterval(this.timer);
+        this.timer = null;
+        this.detach?.();
+        this.detach = null;
+        this.voiceConnection = null;
+
+        const recorder = this.recorder;
+        this.recorder = null;
+        void this.flushing
+            .catch(() => undefined)
+            .then(() => recorder?.discard())
+            .then(() => {
+                cleanupFiles(this.clips.map((clip) => clip.filePath));
+                this.clips = [];
+            })
+            .catch((error) => console.error('[Imakita] Failed to discard destroyed recording:', error));
+        return true;
     }
 }
 
@@ -69,4 +102,8 @@ export class ImakitaSessionManager {
     private sessions = new Map<string, ImakitaSession>();
     getSession(guildId: string): ImakitaSession { let s = this.sessions.get(guildId); if (!s) { s = new ImakitaSession(); this.sessions.set(guildId, s); } return s; }
     getExistingSession(guildId: string): ImakitaSession | null { return this.sessions.get(guildId) || null; }
+    cleanupDestroyedConnection(guildId: string, connection: VoiceConnection): void {
+        const session = this.sessions.get(guildId);
+        if (session?.handleDestroyedConnection(connection)) this.sessions.delete(guildId);
+    }
 }

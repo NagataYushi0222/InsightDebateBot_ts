@@ -13,28 +13,10 @@ interface UserCounters {
     daveDecryptFailures: number;
     daveDecryptSuccesses: number;
     opusPacketsReceived: number;
-    opusDecodeFailures: number;
-    pcmPacketsByConsumer: Map<string, number>;
-    pcmBytesByConsumer: Map<string, number>;
 }
 
-interface UserCountersSnapshot {
-    daveDecryptFailures: number;
-    daveDecryptSuccesses: number;
-    opusPacketsReceived: number;
-    opusDecodeFailures: number;
-    pcmPacketsDelivered: number;
-    pcmBytesDelivered: number;
-}
-
-export interface VoiceConsumerUserStats {
+export interface VoiceConsumerUserStats extends UserCounters {
     userId: string;
-    daveDecryptFailures: number;
-    daveDecryptSuccesses: number;
-    opusPacketsReceived: number;
-    opusDecodeFailures: number;
-    pcmPacketsDelivered: number;
-    pcmBytesDelivered: number;
 }
 
 export interface VoiceConsumerDiagnosticsSnapshot {
@@ -43,27 +25,10 @@ export interface VoiceConsumerDiagnosticsSnapshot {
     users: VoiceConsumerUserStats[];
 }
 
-export interface VoiceLiveConsumerTotals {
-    pcmPacketsDelivered: number;
-    pcmBytesDelivered: number;
-}
+export interface VoiceLiveUserStats extends VoiceConsumerUserStats {}
 
-export interface VoiceLiveUserStats {
-    userId: string;
-    daveDecryptFailures: number;
-    daveDecryptSuccesses: number;
-    opusPacketsReceived: number;
-    opusDecodeFailures: number;
-    pcmByConsumer: Record<string, VoiceLiveConsumerTotals>;
-}
-
-export interface VoiceLiveTotals {
+export interface VoiceLiveTotals extends UserCounters {
     userCount: number;
-    daveDecryptFailures: number;
-    daveDecryptSuccesses: number;
-    opusPacketsReceived: number;
-    opusDecodeFailures: number;
-    pcmByConsumer: Record<string, VoiceLiveConsumerTotals>;
 }
 
 export interface VoiceConnectionLiveSnapshot {
@@ -77,38 +42,11 @@ function emptyCounters(): UserCounters {
         daveDecryptFailures: 0,
         daveDecryptSuccesses: 0,
         opusPacketsReceived: 0,
-        opusDecodeFailures: 0,
-        pcmPacketsByConsumer: new Map(),
-        pcmBytesByConsumer: new Map(),
     };
 }
 
-function cloneCounterSnapshot(counter: UserCounters, consumerLabel: string): UserCountersSnapshot {
-    return {
-        daveDecryptFailures: counter.daveDecryptFailures,
-        daveDecryptSuccesses: counter.daveDecryptSuccesses,
-        opusPacketsReceived: counter.opusPacketsReceived,
-        opusDecodeFailures: counter.opusDecodeFailures,
-        pcmPacketsDelivered: counter.pcmPacketsByConsumer.get(consumerLabel) || 0,
-        pcmBytesDelivered: counter.pcmBytesByConsumer.get(consumerLabel) || 0,
-    };
-}
-
-function cloneConsumerTotals(counter: UserCounters): Record<string, VoiceLiveConsumerTotals> {
-    const labels = new Set<string>([
-        ...counter.pcmPacketsByConsumer.keys(),
-        ...counter.pcmBytesByConsumer.keys(),
-    ]);
-    const result: Record<string, VoiceLiveConsumerTotals> = {};
-
-    for (const label of labels) {
-        result[label] = {
-            pcmPacketsDelivered: counter.pcmPacketsByConsumer.get(label) || 0,
-            pcmBytesDelivered: counter.pcmBytesByConsumer.get(label) || 0,
-        };
-    }
-
-    return result;
+function cloneCounters(counter: UserCounters): UserCounters {
+    return { ...counter };
 }
 
 class VoiceConnectionDiagnostics {
@@ -117,25 +55,18 @@ class VoiceConnectionDiagnostics {
     constructor(private readonly connection: VoiceConnection) {}
 
     ensureDaveInstrumentation(): void {
-        if (this.connection.state.status !== VoiceConnectionStatus.Ready) {
-            return;
-        }
+        if (this.connection.state.status !== VoiceConnectionStatus.Ready) return;
 
         const networkingState = this.connection.state.networking.state as MutableNetworkingState;
         const daveSession = networkingState.dave;
-        if (!daveSession?.decrypt || daveSession.__voiceDiagnosticsWrapped) {
-            return;
-        }
+        if (!daveSession?.decrypt || daveSession.__voiceDiagnosticsWrapped) return;
 
         const originalDecrypt = daveSession.decrypt.bind(daveSession);
         daveSession.decrypt = (packet: Uint8Array, userId: string) => {
             try {
                 const decrypted = originalDecrypt(packet, userId);
-                if (decrypted) {
-                    this.getUserCounters(userId).daveDecryptSuccesses += 1;
-                } else {
-                    this.getUserCounters(userId).daveDecryptFailures += 1;
-                }
+                if (decrypted) this.getUserCounters(userId).daveDecryptSuccesses += 1;
+                else this.getUserCounters(userId).daveDecryptFailures += 1;
                 return decrypted;
             } catch (error) {
                 this.getUserCounters(userId).daveDecryptFailures += 1;
@@ -149,131 +80,56 @@ class VoiceConnectionDiagnostics {
         this.getUserCounters(userId).opusPacketsReceived += 1;
     }
 
-    recordOpusDecodeFailure(userId: string): void {
-        this.getUserCounters(userId).opusDecodeFailures += 1;
-    }
-
-    recordPcmDelivery(userId: string, consumerLabel: string, byteLength: number): void {
-        const counters = this.getUserCounters(userId);
-        counters.pcmPacketsByConsumer.set(
-            consumerLabel,
-            (counters.pcmPacketsByConsumer.get(consumerLabel) || 0) + 1,
+    captureSnapshot(_consumerLabel: string): Map<string, UserCounters> {
+        return new Map(
+            Array.from(this.countersByUser, ([userId, counters]) => [userId, cloneCounters(counters)]),
         );
-        counters.pcmBytesByConsumer.set(
-            consumerLabel,
-            (counters.pcmBytesByConsumer.get(consumerLabel) || 0) + byteLength,
-        );
-    }
-
-    captureSnapshot(consumerLabel: string): Map<string, UserCountersSnapshot> {
-        const snapshot = new Map<string, UserCountersSnapshot>();
-        for (const [userId, counters] of this.countersByUser.entries()) {
-            snapshot.set(userId, cloneCounterSnapshot(counters, consumerLabel));
-        }
-        return snapshot;
     }
 
     buildConsumerSnapshot(
         consumerLabel: string,
-        baseline: Map<string, UserCountersSnapshot> | null,
+        baseline: Map<string, UserCounters> | null,
     ): VoiceConsumerDiagnosticsSnapshot {
-        const users = new Set<string>([
+        const userIds = new Set([
             ...this.countersByUser.keys(),
-            ...(baseline ? baseline.keys() : []),
+            ...(baseline?.keys() ?? []),
         ]);
-
-        const snapshotUsers: VoiceConsumerUserStats[] = Array.from(users)
+        const users = Array.from(userIds)
             .sort()
             .map((userId) => {
-                const currentCounters = this.countersByUser.get(userId);
-                const current = currentCounters
-                    ? cloneCounterSnapshot(currentCounters, consumerLabel)
-                    : {
-                          daveDecryptFailures: 0,
-                          daveDecryptSuccesses: 0,
-                          opusPacketsReceived: 0,
-                          opusDecodeFailures: 0,
-                          pcmPacketsDelivered: 0,
-                          pcmBytesDelivered: 0,
-                      };
-                const previous = baseline?.get(userId) || {
-                    daveDecryptFailures: 0,
-                    daveDecryptSuccesses: 0,
-                    opusPacketsReceived: 0,
-                    opusDecodeFailures: 0,
-                    pcmPacketsDelivered: 0,
-                    pcmBytesDelivered: 0,
-                };
-
+                const current = this.countersByUser.get(userId) ?? emptyCounters();
+                const previous = baseline?.get(userId) ?? emptyCounters();
                 return {
                     userId,
                     daveDecryptFailures: current.daveDecryptFailures - previous.daveDecryptFailures,
                     daveDecryptSuccesses: current.daveDecryptSuccesses - previous.daveDecryptSuccesses,
                     opusPacketsReceived: current.opusPacketsReceived - previous.opusPacketsReceived,
-                    opusDecodeFailures: current.opusDecodeFailures - previous.opusDecodeFailures,
-                    pcmPacketsDelivered: current.pcmPacketsDelivered - previous.pcmPacketsDelivered,
-                    pcmBytesDelivered: current.pcmBytesDelivered - previous.pcmBytesDelivered,
                 };
             })
             .filter((user) =>
                 user.daveDecryptFailures > 0
                 || user.daveDecryptSuccesses > 0
                 || user.opusPacketsReceived > 0
-                || user.opusDecodeFailures > 0
-                || user.pcmPacketsDelivered > 0
-                || user.pcmBytesDelivered > 0
             );
 
-        return {
-            consumerLabel,
-            createdAt: new Date().toISOString(),
-            users: snapshotUsers,
-        };
+        return { consumerLabel, createdAt: new Date().toISOString(), users };
     }
 
     buildLiveSnapshot(): VoiceConnectionLiveSnapshot {
         const users = Array.from(this.countersByUser.entries())
-            .sort(([leftUserId], [rightUserId]) => leftUserId.localeCompare(rightUserId))
-            .map(([userId, counters]) => ({
-                userId,
-                daveDecryptFailures: counters.daveDecryptFailures,
-                daveDecryptSuccesses: counters.daveDecryptSuccesses,
-                opusPacketsReceived: counters.opusPacketsReceived,
-                opusDecodeFailures: counters.opusDecodeFailures,
-                pcmByConsumer: cloneConsumerTotals(counters),
-            }));
-
+            .sort(([left], [right]) => left.localeCompare(right))
+            .map(([userId, counters]) => ({ userId, ...cloneCounters(counters) }));
         const totals: VoiceLiveTotals = {
             userCount: users.length,
-            daveDecryptFailures: 0,
-            daveDecryptSuccesses: 0,
-            opusPacketsReceived: 0,
-            opusDecodeFailures: 0,
-            pcmByConsumer: {},
+            ...emptyCounters(),
         };
 
         for (const user of users) {
             totals.daveDecryptFailures += user.daveDecryptFailures;
             totals.daveDecryptSuccesses += user.daveDecryptSuccesses;
             totals.opusPacketsReceived += user.opusPacketsReceived;
-            totals.opusDecodeFailures += user.opusDecodeFailures;
-
-            for (const [consumerLabel, consumerTotals] of Object.entries(user.pcmByConsumer)) {
-                const current = totals.pcmByConsumer[consumerLabel] || {
-                    pcmPacketsDelivered: 0,
-                    pcmBytesDelivered: 0,
-                };
-                current.pcmPacketsDelivered += consumerTotals.pcmPacketsDelivered;
-                current.pcmBytesDelivered += consumerTotals.pcmBytesDelivered;
-                totals.pcmByConsumer[consumerLabel] = current;
-            }
         }
-
-        return {
-            createdAt: new Date().toISOString(),
-            users,
-            totals,
-        };
+        return { createdAt: new Date().toISOString(), users, totals };
     }
 
     private getUserCounters(userId: string): UserCounters {
@@ -294,7 +150,6 @@ export function ensureVoiceConnectionDiagnostics(connection: VoiceConnection): V
         diagnostics = new VoiceConnectionDiagnostics(connection);
         diagnosticsByConnection.set(connection, diagnostics);
     }
-
     diagnostics.ensureDaveInstrumentation();
     return diagnostics;
 }

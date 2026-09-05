@@ -9,7 +9,6 @@ const MAX_STATUS_MESSAGE_LENGTH = 1_900;
 const MAX_INLINE_TEXT_LENGTH = 80;
 const MAX_SPEAKER_LINES = 3;
 const DAVE_WARNING_RATE = 0.05;
-const OPUS_WARNING_RATE = 0.02;
 const MIN_PACKETS_FOR_QUALITY_WARNING = 50;
 
 interface TrackedStatusMessage {
@@ -394,13 +393,9 @@ export class LiveVoiceStatusDisplay {
         const totals = liveSnapshot.totals;
         const daveTotal = totals.daveDecryptSuccesses + totals.daveDecryptFailures;
         const daveFailureRate = rateValue(totals.daveDecryptFailures, daveTotal);
-        const opusFailureRate = rateValue(totals.opusDecodeFailures, totals.opusPacketsReceived);
         const hasWarning = (
             daveTotal >= MIN_PACKETS_FOR_QUALITY_WARNING
             && daveFailureRate >= DAVE_WARNING_RATE
-        ) || (
-            totals.opusPacketsReceived >= MIN_PACKETS_FOR_QUALITY_WARNING
-            && opusFailureRate >= OPUS_WARNING_RATE
         );
 
         return {
@@ -409,7 +404,7 @@ export class LiveVoiceStatusDisplay {
                 `成功 \`${totals.daveDecryptSuccesses}\``,
                 `失敗 \`${totals.daveDecryptFailures}\``,
                 `失敗率 \`${formatRate(totals.daveDecryptFailures, daveTotal)}\``,
-                `Opus失敗率 \`${formatRate(totals.opusDecodeFailures, totals.opusPacketsReceived)}\``,
+                `Opus packet \`${totals.opusPacketsReceived}\``,
                 `音声品質: \`${hasWarning ? '注意' : 'OK'}\``,
             ].join(' / '),
             hasWarning,
@@ -432,9 +427,6 @@ export class LiveVoiceStatusDisplay {
                 if (right.daveDecryptFailures !== left.daveDecryptFailures) {
                     return right.daveDecryptFailures - left.daveDecryptFailures;
                 }
-                if (right.opusDecodeFailures !== left.opusDecodeFailures) {
-                    return right.opusDecodeFailures - left.opusDecodeFailures;
-                }
                 return right.opusPacketsReceived - left.opusPacketsReceived;
             })
             .slice(0, MAX_SPEAKER_LINES);
@@ -456,7 +448,7 @@ export class LiveVoiceStatusDisplay {
         const daveTotal = user.daveDecryptSuccesses + user.daveDecryptFailures;
         return [
             `- ${displayName}`,
-            `DAVE失敗 \`${user.daveDecryptFailures}\` / 失敗率 \`${formatRate(user.daveDecryptFailures, daveTotal)}\` / Opus失敗 \`${user.opusDecodeFailures}\` / 受信 \`${user.opusPacketsReceived}\``,
+            `DAVE失敗 \`${user.daveDecryptFailures}\` / 失敗率 \`${formatRate(user.daveDecryptFailures, daveTotal)}\` / Opus受信 \`${user.opusPacketsReceived}\``,
         ].join(' ');
     }
 

@@ -28,7 +28,7 @@ Discord のボイスチャットを録音し、Gemini API で定期分析・最�
 - **GitHub 連携フロー**: ローカルで修正 → `git push origin main` →
   OCI 上で `cd ~/InsightDebateBot && git pull && sudo systemctl restart insight-vc-bot`
   （`discord-bot` という古いユニット名ではなく `insight-vc-bot` が正式名）
-- **必須依存**: Bun, FFmpeg, Discord Bot Token, Gemini API Key
+- **必須依存**: Bun, Discord Bot Token, Gemini API Key（FFmpeg/ffprobe はOgg integration test時のみ）
 - **環境変数**: `.env` に `DISCORD_TOKEN`（必須）、既定 `GEMINI_API_KEY`（任意）、`GUILD_ID`（任意）
 - **DB**: `bot_settings.db`（Bun SQLite、ギルドごとの API キー・モデル・間隔・モードを保持）
 
@@ -36,22 +36,18 @@ Discord のボイスチャットを録音し、Gemini API で定期分析・最�
 
 ```bash
 bun install
-bunx tsc --noEmit            # 型チェック（CI の代用）
+bun run typecheck
+bun test
+bun run build
 bun run src/index_with_vc_article.ts   # ローカル起動
 bun run dev                  # watch モード
 ```
 
 ### 型チェックに関する注意
 
-`bunx tsc --noEmit` を実行すると `src/database.ts` の `bun:sqlite` と
-`node_modules/@ovencord/voice|util` 系で **既知の環境差分エラー** が出ます。
-これは OCI 上の Bun 実行環境では発生しないため無視してください。
-**修正対象ファイル由来のエラーだけを追究** します。既知エラーは:
-
-- `src/database.ts: Cannot find module 'bun:sqlite'`（Bun 専用）
-- `node_modules/@ovencord/voice/src/networking/VoiceUDPSocket.ts` 系の `Cannot find name 'Bun'` 等
-
-それ以外の `src/` 由来エラーが出た場合は、自分の変更が原因と判断して修正してください。
+`bun install` のpostinstallで、利用中のTypeScript/@noble版に合わせて
+`@ovencord/voice` の互換パッチを適用する。型チェックが依存パッケージ内で失敗した場合は、
+先に `bun run scripts/patch-ovencord-voice.ts` を再実行する。`bun run typecheck` は成功が必須。
 
 ## 3. ディレクトリ構造
 
@@ -64,10 +60,10 @@ src/
 ├── database.ts                # SQLite ギルド設定（bun:sqlite 使用）
 ├── sessionManager.ts          # 要約系セッション（GuildSession / SessionManager）
 ├── sharedVoiceCoordinator.ts  # 音声接続の共有・再接続・切断監視
-├── voiceCaptureHub.ts         # ユーザーごとの Opus 受信 + PCM 復号のハブ
-├── opusDecoder.ts             # Opus → PCM デコーダ
-├── recorder.ts                # ユーザー別 PCM ファイル書き出し
-├── audioProcessor.ts          # PCM → MP3 変換（非同期 spawn 版）とファイル削除
+├── voiceCaptureHub.ts         # DAVE復号済みOpus packetの共有受信ハブ
+├── oggOpusMuxer.ts            # Opus packetを再エンコードせずOggへmux
+├── recorder.ts                # ユーザー別Ogg/Opusストリーム書き出し
+├── audioProcessor.ts          # 一時音声ファイルの削除
 ├── analyzer.ts                # 要約系 Gemini 分析（PROMPTS/構造化メモ/Web検索）
 ├── geminiWebSearch.ts         # Gemini 経由の Web 検索 function calling
 ├── searchTool.ts              # 検索結果 fetch と URL 検証
@@ -120,22 +116,20 @@ src/
 
 ```
 Discord音声WebSocket
-    ↓ (receiver.speaking start イベント)
-voiceCaptureHub.ts  ── 参加者ごとに Opus 受信
-    ↓ OpusDecoder
-    ↓ PCM (s16le/48kHz/2ch)
-recorder.ts ── temp_audio/recording_<userId>_<ts>.pcm へ書込
+    ↓ DAVE復号
+voiceCaptureHub.ts  ── 参加者ごとに復号済みOpus packetを受信
+    ↓ OggOpusMuxer（transcodeなし）
+recorder.ts ── temp_audio/recording_<userId>_<ts>.ogg へ書込
     ↓ 定期 interval 経過
 sessionManager.runProcessAudio / vcArticle.flushCurrentChunk
     ↓ recorder.flushAudio()
-    ↓ audioProcessor.convertToMp3Async(spawn ffmpeg)  ← 非同期必須
-    ↓ MP3
-Gemini File API (ai.files.upload → waitForFilesActive → generateContent)
+Gemini File API (audio/ogg; upload → PROCESSING → ACTIVE → generateContent)
 ```
 
 このパイプラインのどの段階でも**イベントループを長時間 block しない**こと。
-ffmpeg 変換や Gemini API 呼び出しは非同期で待つ。
-audioProcessor はすでに `convertToMp3Async` に非同期化済み（`execSync` 版に戻さないこと）。
+Gemini API 呼び出しは非同期で待つ。通常経路でOpusをPCMへdecodeしたり、MP3へtranscodeしたりしない。
+複数のOggをraw byte concatenateしない。retry音声は独立したaudio partとしてGeminiへ渡す。
+FFmpegはテスト時の完全デコード・duration検証にのみ利用する。
 
 ## 6. 音声接続と切断の扱い（ここを変えるときは慎重に）
 
@@ -213,8 +207,7 @@ ssh -i ~/Downloads/ssh-key-2026-02-13.key ubuntu@161.33.38.160 "tail -30 ~/Insig
 - コミットメッセージは **英語**（`git log` を見ると既存コミットはすべて英語短文）。
   例: `Fix VC auto-disconnect via async encode and auto-reconnect`
 - 1 コミット 1 テーマ。関数差し替えと無関係な `bot_settings.db*` を同時にコミットしない。
-- ランタイム DB（`bot_settings.db*`）は変更しない（コミットしない）。
-  必要なら `.gitignore` に入れる候補だが現在は追跡対象のまま。
+- ランタイム DB（`bot_settings.db*`）は `.gitignore` 対象。変更・コミット・削除しない。
 
 ## 11. 既知の落とし穴
 

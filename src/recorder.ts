@@ -1,99 +1,129 @@
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import crypto from 'crypto';
 import { TEMP_AUDIO_DIR } from './config';
-import { ensureTempDir } from './audioProcessor';
 import { OggOpusMuxer } from './oggOpusMuxer';
 
-/**
- * ユーザーごとの音声をディスクに直接書き込むレコーダー
- * メモリ使用量を抑えるため、バッファリングせずにストリームで書き込む
- */
-export class UserAudioRecorder {
-    private writeStreams: Map<string, fs.WriteStream> = new Map();
-    private activeFilePaths: Map<string, string> = new Map();
-    private muxers: Map<string, OggOpusMuxer> = new Map();
+interface OpenRecording {
+    userId: string;
+    filePath: string;
+    stream: fs.WriteStream;
+    muxer: OggOpusMuxer;
+}
 
-    constructor() {
-        ensureTempDir();
+/** ユーザー別のOpus packetを再エンコードせずOggへ書き出す。 */
+export class UserAudioRecorder {
+    private writeStreams = new Map<string, fs.WriteStream>();
+    private activeFilePaths = new Map<string, string>();
+    private muxers = new Map<string, OggOpusMuxer>();
+    private readonly failedStreams = new WeakSet<fs.WriteStream>();
+
+    constructor(private readonly outputDirectory: string = TEMP_AUDIO_DIR) {
+        fs.mkdirSync(this.outputDirectory, { recursive: true, mode: 0o700 });
     }
 
-    /**
-     * ユーザーのPCMデータをファイルに書き込み
-     */
     writeOpus(userId: string, opusPacket: Buffer): void {
-        // Discord 側の終端通知等を音声 packet として mux しない。
         if (opusPacket.length === 0) return;
 
         let stream = this.writeStreams.get(userId);
-
         if (!stream) {
             const filename = path.join(
-                TEMP_AUDIO_DIR,
-                `recording_${userId}_${Date.now()}_${crypto.randomUUID()}.ogg`
+                this.outputDirectory,
+                `recording_${userId}_${Date.now()}_${crypto.randomUUID()}.ogg`,
             );
             stream = fs.createWriteStream(filename, { flags: 'wx', mode: 0o600 });
+            stream.on('error', (error) => {
+                this.failedStreams.add(stream!);
+                console.error(`Ogg recording stream error for user ${userId}:`, error);
+            });
+
+            const muxer = new OggOpusMuxer();
             this.writeStreams.set(userId, stream);
             this.activeFilePaths.set(userId, filename);
-            const muxer = new OggOpusMuxer();
             this.muxers.set(userId, muxer);
             stream.write(Buffer.concat(muxer.headers()));
-
-            // エラーハンドリング
-            stream.on('error', (err) => {
-                console.error(`Stream error for user ${userId}:`, err);
-            });
         }
 
-        const page = this.muxers.get(userId)!.packet(opusPacket);
-        if (page.length > 0) stream.write(page);
+        try {
+            const page = this.muxers.get(userId)!.packet(opusPacket);
+            if (page.length > 0) stream.write(page);
+        } catch (error) {
+            this.failedStreams.add(stream);
+            console.error(`Invalid Opus packet for user ${userId}:`, error);
+        }
     }
 
-    /**
-     * 現在書き込み中のファイルをクローズし、パスを返却する
-     * 次回の書き込み書き込み時に新しいファイルが作成される
-     */
+    /** 現在の録音をEOSまで確定し、正常にcloseできたファイルだけを返す。 */
     async flushAudio(): Promise<Map<string, string>> {
-        const flushedFiles = new Map<string, string>();
-        const closePromises: Promise<void>[] = [];
+        const recordings = await this.finalizeOpenRecordings();
+        const failed = recordings.filter(({ stream }) => this.failedStreams.has(stream));
 
-        for (const [userId, stream] of this.writeStreams.entries()) {
-            const filePath = this.activeFilePaths.get(userId);
-
-            closePromises.push(new Promise((resolve) => {
-                stream.once('close', resolve);
-                stream.once('finish', resolve);
-                const eosPage = this.muxers.get(userId)?.end() ?? Buffer.alloc(0);
-                if (eosPage.length > 0) stream.end(eosPage);
-                else stream.end();
-            }));
-
-            if (filePath) {
-                flushedFiles.set(userId, filePath);
-            }
+        if (failed.length > 0) {
+            this.deleteRecordings(recordings);
+            throw new Error(
+                `Failed to finalize Ogg recording for user(s): ${failed.map(({ userId }) => userId).join(', ')}`,
+            );
         }
 
-        await Promise.all(closePromises);
-
-        // マップをクリア（次回の write で新規作成させる）
-        this.writeStreams.clear();
-        this.activeFilePaths.clear();
-        this.muxers.clear();
-
-        const existingFiles = new Map<string, string>();
-        for (const [userId, filePath] of flushedFiles.entries()) {
+        const files = new Map<string, string>();
+        for (const { userId, filePath } of recordings) {
             if (fs.existsSync(filePath) && fs.statSync(filePath).size > 0) {
-                existingFiles.set(userId, filePath);
+                files.set(userId, filePath);
             }
         }
-
-        return existingFiles;
+        return files;
     }
 
-    /**
-     * データが存在するか（書き込み中のストリームがあるか）
-     */
+    /** 異常終了用。EOSを書いてstreamを閉じた後、録音ファイルを破棄する。 */
+    async discard(): Promise<void> {
+        const recordings = await this.finalizeOpenRecordings();
+        this.deleteRecordings(recordings);
+    }
+
     hasData(): boolean {
         return this.writeStreams.size > 0;
+    }
+
+    private async finalizeOpenRecordings(): Promise<OpenRecording[]> {
+        const recordings: OpenRecording[] = [];
+        for (const [userId, stream] of this.writeStreams) {
+            const filePath = this.activeFilePaths.get(userId);
+            const muxer = this.muxers.get(userId);
+            if (filePath && muxer) recordings.push({ userId, filePath, stream, muxer });
+        }
+
+        // close待ちの間に届くpacketは、次のOgg streamへ書けるよう先に世代を切り替える。
+        this.writeStreams = new Map();
+        this.activeFilePaths = new Map();
+        this.muxers = new Map();
+
+        await Promise.all(recordings.map(({ stream, muxer }) => new Promise<void>((resolve) => {
+            if (stream.closed) {
+                resolve();
+                return;
+            }
+            stream.once('close', resolve);
+            try {
+                const eosPage = muxer.end();
+                if (eosPage.length > 0) stream.end(eosPage);
+                else stream.end();
+            } catch (error) {
+                this.failedStreams.add(stream);
+                console.error('Failed to finalize Ogg recording stream:', error);
+                stream.destroy();
+            }
+        })));
+
+        return recordings;
+    }
+
+    private deleteRecordings(recordings: OpenRecording[]): void {
+        for (const { filePath } of recordings) {
+            try {
+                if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+            } catch (error) {
+                console.error(`Error removing discarded recording ${filePath}:`, error);
+            }
+        }
     }
 }

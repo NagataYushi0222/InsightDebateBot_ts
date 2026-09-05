@@ -52,6 +52,7 @@ export class VcArticleSession {
     private chunkTimer: ReturnType<typeof setInterval> | null = null;
     private chunkSequence = 0;
     private chunkProcessing: Promise<void> = Promise.resolve();
+    private chunkFailure: Error | null = null;
     private isStopping = false;
     private readonly consumerLabel: string;
     private lastVoiceStats: VoiceConsumerDiagnosticsSnapshot | null = null;
@@ -206,6 +207,7 @@ export class VcArticleSession {
         this.sessionStartedAt = new Date();
         this.pendingAudioClips = [];
         this.chunkSequence = 0;
+        this.chunkFailure = null;
         this.chunkProcessing = Promise.resolve();
         this.lastVoiceStats = null;
         guild.members.cache.forEach((member) => {
@@ -214,7 +216,7 @@ export class VcArticleSession {
             }
         });
         this.chunkTimer = setInterval(() => {
-            void this.enqueueChunkProcessing();
+            void this.enqueueChunkProcessing().catch(() => undefined);
         }, ARTICLE_CHUNK_INTERVAL_MS);
         this.detachFromVoiceCapture();
         this.detachVoiceCapture = attachVoiceCaptureConsumer(connection, {
@@ -276,6 +278,7 @@ export class VcArticleSession {
         this.sessionStartedAt = null;
         this.pendingAudioClips = [];
         this.chunkSequence = 0;
+        this.chunkFailure = null;
         this.textEntries = [];
         this.userMap = new Map();
 
@@ -417,7 +420,7 @@ export class VcArticleSession {
         this.clearChunkTimer();
         await this.chunkProcessing.catch(() => undefined);
         this.releaseVoiceConnection(destroyConnection);
-        this.resetLiveResources();
+        await this.discardLiveResources();
         await this.clearFinalizedArtifacts();
     }
 
@@ -429,7 +432,9 @@ export class VcArticleSession {
         this.logVoiceStats('connection_destroyed');
         this.clearChunkTimer();
         this.voiceConnection = null;
-        this.resetLiveResources();
+        void this.discardLiveResources().catch((error) => {
+            console.error(`[${this.guildId}] Failed to discard article recorder after destroyed connection:`, error);
+        });
         return true;
     }
 
@@ -442,13 +447,17 @@ export class VcArticleSession {
         }
     }
 
-    private resetLiveResources(): void {
-        cleanupFiles(this.pendingAudioClips.map((clip) => clip.filePath));
+    private async discardLiveResources(): Promise<void> {
+        const recorder = this.recorder;
         this.recorder = null;
+        await this.chunkProcessing.catch(() => undefined);
+        await recorder?.discard();
+        cleanupFiles(this.pendingAudioClips.map((clip) => clip.filePath));
         this.targetTextChannel = null;
         this.sessionStartedAt = null;
         this.pendingAudioClips = [];
         this.chunkSequence = 0;
+        this.chunkFailure = null;
     }
 
     private async clearFinalizedArtifacts(): Promise<void> {
@@ -464,14 +473,19 @@ export class VcArticleSession {
 
     private async enqueueChunkProcessing(): Promise<void> {
         this.chunkProcessing = this.chunkProcessing
+            .catch(() => undefined)
             .then(async () => {
                 await this.flushCurrentChunk();
-            })
-            .catch((error) => {
-                console.error(`[${this.guildId}] VC article chunk processing error:`, error);
             });
 
-        await this.chunkProcessing;
+        try {
+            await this.chunkProcessing;
+        } catch (error) {
+            this.chunkFailure = error instanceof Error ? error : new Error(String(error));
+            console.error(`[${this.guildId}] VC article chunk processing error:`, error);
+            throw error;
+        }
+        if (this.chunkFailure) throw this.chunkFailure;
     }
 
     private async flushCurrentChunk(): Promise<void> {
@@ -520,9 +534,6 @@ export class VcArticleSession {
                     `dave_ok=${user.daveDecryptSuccesses}`,
                     `dave_fail=${user.daveDecryptFailures}`,
                     `opus_ok=${user.opusPacketsReceived}`,
-                    `opus_decode_fail=${user.opusDecodeFailures}`,
-                    `pcm_packets=${user.pcmPacketsDelivered}`,
-                    `pcm_bytes=${user.pcmBytesDelivered}`,
                 ].join(' '),
             );
         }
