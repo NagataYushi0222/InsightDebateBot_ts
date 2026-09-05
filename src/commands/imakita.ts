@@ -114,6 +114,7 @@ export async function handleImakitaCommand(
         const ai = new GoogleGenAI({ apiKey: userKey });
         const temporaryFiles: string[] = [];
         const uploadedFiles: any[] = [];
+        try {
         for (const clip of clips) {
             const uploaded = await ai.files.upload({ file: clip.filePath, config: { mimeType: 'audio/ogg' } });
             uploadedFiles.push(uploaded);
@@ -144,8 +145,10 @@ export async function handleImakitaCommand(
         }), SUMMARY_TIMEOUT_MS);
 
         await interaction.editReply(normalizeSummary(response.text || ''));
-        await Promise.all(uploadedFiles.map((file) => ai.files.delete({ name: file.name }).catch(() => undefined)));
-        cleanupFiles(temporaryFiles);
+        } finally {
+            await Promise.all(uploadedFiles.map((file) => ai.files.delete({ name: file.name }).catch(() => undefined)));
+            cleanupFiles(temporaryFiles);
+        }
     } catch (error) {
         console.error('[Imakita] Failed to generate summary:', error);
         const message = error instanceof Error ? error.message : String(error);
