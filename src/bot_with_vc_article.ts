@@ -348,6 +348,13 @@ async function startImakitaCaptureForAnalyze(
     console.log(`[Imakita] Started passive capture alongside analysis for guild ${guildId}`);
 }
 
+async function stopImakitaCaptureForAnalyze(guildId: string): Promise<void> {
+    const imakitaSession = imakitaManager.getExistingSession(guildId);
+    if (!imakitaSession?.isRecording) return;
+    await imakitaSession.stop(false);
+    console.log(`[Imakita] Stopped passive capture alongside analysis for guild ${guildId}`);
+}
+
 async function handleImakitaJoin(interaction: ChatInputCommandInteraction, guildId: string): Promise<void> {
     const member = interaction.guild!.members.cache.get(interaction.user.id);
     const voiceChannel = member?.voice.channel;
@@ -372,6 +379,7 @@ async function handleAnalyzeStop(
     interaction: ChatInputCommandInteraction,
     guildId: string
 ): Promise<void> {
+    await stopImakitaCaptureForAnalyze(guildId);
     await handleConfiguredAnalyzeLikeStop(interaction, guildId, analyzeModeEnvironment, 'analyze', true);
 }
 
@@ -379,6 +387,7 @@ async function handleAnalyzeStopFinal(
     interaction: ChatInputCommandInteraction,
     guildId: string
 ): Promise<void> {
+    await stopImakitaCaptureForAnalyze(guildId);
     await handleConfiguredAnalyzeLikeStop(interaction, guildId, analyzeModeEnvironment, 'analyze', false);
 }
 
