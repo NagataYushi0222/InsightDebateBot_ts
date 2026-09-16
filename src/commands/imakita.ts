@@ -8,15 +8,22 @@ import {
 import { isGeminiThinkingModel, resolveGeminiModel } from '../config';
 import { getGuildSettings } from '../database';
 import { getRequiredUserApiKey } from './settings';
-import { ImakitaSessionManager } from '../imakitaSession';
+import {
+    IMAKITA_RETENTION_MINUTES,
+    IMAKITA_RETENTION_MS,
+    ImakitaAudioClip,
+    ImakitaSessionManager,
+} from '../imakitaSession';
 import { cleanupFiles } from '../audioProcessor';
 import { retryGeminiInvalidArgument } from '../geminiRetry';
+import { mapWithConcurrency } from '../asyncPool';
 
 const FETCH_LIMIT = 100;
 const SUMMARY_MESSAGE_LIMIT = 50;
 const SUMMARY_INPUT_MAX_LENGTH = 12_000;
 const SUMMARY_TIMEOUT_MS = 45_000;
 const FILE_PROCESSING_TIMEOUT_MS = 180_000;
+const FILE_UPLOAD_CONCURRENCY = 4;
 
 function logPerformance(guildId: string, requestId: string, stage: string, startedAt: number, extra: Record<string, unknown> = {}): void {
     console.log(JSON.stringify({
@@ -142,12 +149,12 @@ export async function handleImakitaCommand(
     try {
         const session = imakitaManager.getSession(guildId);
         if (!session.isRecording) {
-            await interaction.editReply('❌ 先にVC内で `/join` を実行してください。今北産業は `/join` 後に保持した直近10分の音声を要約します。');
+            await interaction.editReply(`❌ 先にVC内で \`/join\` を実行してください。今北産業は \`/join\` 後に保持した直近${IMAKITA_RETENTION_MINUTES}分の音声を要約します。`);
             return;
         }
         const fetched = await interaction.channel.messages.fetch({ limit: FETCH_LIMIT });
         const chronologicalMessages = Array.from(fetched.values())
-            .filter((message) => message.createdTimestamp >= Date.now() - 10 * 60 * 1000)
+            .filter((message) => message.createdTimestamp >= Date.now() - IMAKITA_RETENTION_MS)
             .sort((a, b) => a.createdTimestamp - b.createdTimestamp);
         const conversation = buildConversation(chronologicalMessages);
         logPerformance(guildId, requestId, 'chat_collected', startedAt, {
@@ -160,15 +167,18 @@ export async function handleImakitaCommand(
             audioBytes: clips.reduce((total, clip) => total + fs.statSync(clip.filePath).size, 0),
             speakerCount: new Set(clips.map((clip) => clip.userId)).size,
         });
-        if (clips.length === 0) { await interaction.editReply('📰 **今北産業**\n・直近10分に要約できるVC音声がありません。'); return; }
-        await interaction.editReply('🎧 直近10分のVC音声とチャットを要約しています...');
+        if (clips.length === 0) { await interaction.editReply(`📰 **今北産業**\n・直近${IMAKITA_RETENTION_MINUTES}分に要約できるVC音声がありません。`); return; }
+        await interaction.editReply(`🎧 直近${IMAKITA_RETENTION_MINUTES}分のVC音声とチャットを要約しています...`);
 
         const modelName = resolveGeminiModel(getGuildSettings(guildId).model_name);
         const ai = new GoogleGenAI({ apiKey: userKey });
         const temporaryFiles: string[] = [];
         const uploadedFiles: any[] = [];
         try {
-        for (const clip of clips) {
+        const uploadedInputs = await mapWithConcurrency<ImakitaAudioClip, { clip: ImakitaAudioClip; file: any }>(
+            clips,
+            FILE_UPLOAD_CONCURRENCY,
+            async (clip) => {
             const uploadStartedAt = Date.now();
             const uploaded = await ai.files.upload({ file: clip.filePath, config: { mimeType: 'audio/ogg' } });
             uploadedFiles.push(uploaded);
@@ -176,11 +186,13 @@ export async function handleImakitaCommand(
                 clipBytes: fs.statSync(clip.filePath).size,
                 uploadedFileCount: uploadedFiles.length,
             });
-        }
+                return { clip, file: uploaded };
+            },
+        );
         if (uploadedFiles.length === 0) { cleanupFiles(temporaryFiles); await interaction.editReply('⚠️ VC音声を要約用に変換できませんでした。'); return; }
         await waitForFilesActive(ai, uploadedFiles);
-        for (const [index, file] of uploadedFiles.entries()) {
-            const filePath = clips[index]?.filePath;
+        for (const { clip, file } of uploadedInputs) {
+            const filePath = clip.filePath;
             if (!filePath || !fs.existsSync(filePath)) continue;
             console.log('[Gemini] Ready audio file', {
                 audioPath: filePath,
@@ -204,7 +216,7 @@ export async function handleImakitaCommand(
                     '会話ログ:',
                     conversation,
                 ].join('\n'),
-            }, ...uploadedFiles.map((file) => ({ fileData: { fileUri: file.uri, mimeType: 'audio/ogg' } }))],
+            }, ...uploadedInputs.map(({ file }) => ({ fileData: { fileUri: file.uri, mimeType: 'audio/ogg' } }))],
         }];
         const generateSummary = (includeThinkingConfig: boolean) => withTimeout(ai.models.generateContent({
             model: modelName,

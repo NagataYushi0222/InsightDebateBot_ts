@@ -364,7 +364,7 @@ async function handleImakitaJoin(interaction: ChatInputCommandInteraction, guild
     await interaction.deferReply();
     const { connection } = await sharedVoiceCoordinator.ensureVoiceConnectionForChannel(guildId, voiceChannel, interaction.guild!.voiceAdapterCreator);
     await session.start(connection, interaction.guild!);
-    await interaction.editReply(`🎧 **今北産業用録音を開始しました**\n対象VC: **${voiceChannel.name}**\n直近10分だけを保持します。定期分析は実行しません。`);
+    await interaction.editReply(`🎧 **今北産業用録音を開始しました**\n対象VC: **${voiceChannel.name}**\n直近5分だけを保持します。定期分析は実行しません。`);
 }
 
 async function handleImakitaLeave(interaction: ChatInputCommandInteraction, guildId: string): Promise<void> {

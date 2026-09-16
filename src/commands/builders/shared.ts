@@ -76,8 +76,8 @@ export function buildSharedUtilityCommands(): SharedCommandBuilder[] {
             .setDescription('現在のBot設定を確認します'),
         new SlashCommandBuilder()
             .setName('imakita')
-            .setDescription('今北産業：VC音声と直近10分のチャットを3行で要約します'),
-        new SlashCommandBuilder().setName('join').setDescription('今北産業用にVCへ参加し、直近10分の録音を開始します'),
+            .setDescription('今北産業：VC音声と直近5分のチャットを3行で要約します'),
+        new SlashCommandBuilder().setName('join').setDescription('今北産業用にVCへ参加し、直近5分の録音を開始します'),
         new SlashCommandBuilder().setName('leave').setDescription('今北産業用の録音を停止し、VCから退出します'),
     ];
 }

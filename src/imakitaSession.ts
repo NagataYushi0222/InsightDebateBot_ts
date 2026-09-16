@@ -4,7 +4,8 @@ import { cleanupFiles } from './audioProcessor';
 import { UserAudioRecorder } from './recorder';
 import { attachVoiceCaptureConsumer } from './voiceCaptureHub';
 
-const RETENTION_MS = 10 * 60 * 1000;
+export const IMAKITA_RETENTION_MINUTES = 5;
+export const IMAKITA_RETENTION_MS = IMAKITA_RETENTION_MINUTES * 60 * 1000;
 const CHUNK_MS = 60 * 1000;
 
 export interface ImakitaAudioClip { userId: string; displayName: string; filePath: string; capturedAt: number; }
@@ -42,8 +43,8 @@ export class ImakitaSession {
             const raw = await this.recorder?.flushAudio() || new Map<string, string>();
             const now = Date.now();
             for (const [userId, filePath] of raw) this.clips.push({ userId, displayName: this.users.get(userId) || `User_${userId}`, filePath, capturedAt: now });
-            const expired = this.clips.filter((clip) => clip.capturedAt < now - RETENTION_MS);
-            this.clips = this.clips.filter((clip) => clip.capturedAt >= now - RETENTION_MS);
+            const expired = this.clips.filter((clip) => clip.capturedAt < now - IMAKITA_RETENTION_MS);
+            this.clips = this.clips.filter((clip) => clip.capturedAt >= now - IMAKITA_RETENTION_MS);
             cleanupFiles(expired.map((clip) => clip.filePath));
         });
         await this.flushing;
